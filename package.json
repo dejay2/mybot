@@ -1,0 +1,26 @@
+{
+  "name": "pi-telegram",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Telegram DM bridge extension for pi",
+  "type": "module",
+  "keywords": ["pi-package", "pi", "telegram", "bot", "extension"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/badlogic/pi-telegram.git"
+  },
+  "homepage": "https://github.com/badlogic/pi-telegram",
+  "bugs": {
+    "url": "https://github.com/badlogic/pi-telegram/issues"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@sinclair/typebox": "*"
+  }
+}
