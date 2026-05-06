@@ -66,10 +66,22 @@ RUNTIME_DIR="$REPO_ROOT/runtime/agent"
 mkdir -p "$RUNTIME_DIR"
 echo "    runtime dir: $RUNTIME_DIR"
 
-EXTENSION_CACHE_DIR="$RUNTIME_DIR/git/github.com/dejay2/mybot-telegram-bot"
-mkdir -p "$(dirname "$EXTENSION_CACHE_DIR")"
-ln -sfn "$REPO_ROOT/packages/telegram-bot" "$EXTENSION_CACHE_DIR"
-echo "    telegram-bot extension symlinked at runtime/agent/git/.../mybot-telegram-bot"
+# Register the telegram-bot package as a local-path source. Pi's package
+# manager treats anything that isn't npm:/git:/etc. as a local path and loads
+# from disk directly — no clone, no pull, no symlink hack.
+SETTINGS_PATH="$RUNTIME_DIR/settings.json"
+if [[ ! -f "$SETTINGS_PATH" ]]; then
+  cat > "$SETTINGS_PATH" <<EOF
+{
+  "packages": [
+    "$REPO_ROOT/packages/telegram-bot"
+  ]
+}
+EOF
+  echo "    settings.json created with local telegram-bot package"
+else
+  echo "    settings.json already exists; leaving package list alone"
+fi
 
 CONFIG_PATH="$RUNTIME_DIR/telegram.json"
 cat > "$CONFIG_PATH" <<EOF
