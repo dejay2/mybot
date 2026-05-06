@@ -1220,6 +1220,13 @@ export interface ExtensionAPI {
 	/** Get available slash commands in the current session. */
 	getCommands(): SlashCommandInfo[];
 
+	/**
+	 * Dispatch a registered slash command by name (built-in or extension-registered).
+	 * Equivalent to a user typing `/<name> <args>` interactively. Resolves to true if
+	 * the command was found and handled, false if no command with that name exists.
+	 */
+	executeCommand(name: string, args?: string): Promise<boolean>;
+
 	// =========================================================================
 	// Model and Thinking Level
 	// =========================================================================
@@ -1431,6 +1438,14 @@ export type GetAllToolsHandler = () => ToolInfo[];
 
 export type GetCommandsHandler = () => SlashCommandInfo[];
 
+/**
+ * Programmatically dispatch a registered slash command (built-in or extension).
+ * Resolves to true if the command was found and handled, false if no command
+ * with that name is registered. Handler errors are reported via the runner's
+ * error channel just like user-typed slash commands.
+ */
+export type ExecuteCommandHandler = (name: string, args?: string) => Promise<boolean>;
+
 export type SetActiveToolsHandler = (toolNames: string[]) => void;
 
 export type RefreshToolsHandler = () => void;
@@ -1481,6 +1496,7 @@ export interface ExtensionActions {
 	setActiveTools: SetActiveToolsHandler;
 	refreshTools: RefreshToolsHandler;
 	getCommands: GetCommandsHandler;
+	executeCommand: ExecuteCommandHandler;
 	setModel: SetModelHandler;
 	getThinkingLevel: GetThinkingLevelHandler;
 	setThinkingLevel: SetThinkingLevelHandler;

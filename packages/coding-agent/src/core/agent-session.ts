@@ -1113,6 +1113,17 @@ export class AgentSession {
 	/**
 	 * Try to execute an extension command. Returns true if command was found and executed.
 	 */
+	/**
+	 * Programmatically dispatch a registered slash command by name.
+	 * Exposed to extensions as `pi.executeCommand(name, args?)`. Resolves to
+	 * true when handled, false when no command with that name is registered.
+	 */
+	async executeCommand(name: string, args?: string): Promise<boolean> {
+		const trimmed = name.startsWith("/") ? name.slice(1) : name;
+		const text = args && args.length > 0 ? `/${trimmed} ${args}` : `/${trimmed}`;
+		return this._tryExecuteExtensionCommand(text);
+	}
+
 	private async _tryExecuteExtensionCommand(text: string): Promise<boolean> {
 		// Parse command name and args
 		const spaceIndex = text.indexOf(" ");
@@ -2191,6 +2202,7 @@ export class AgentSession {
 				setActiveTools: (toolNames) => this.setActiveToolsByName(toolNames),
 				refreshTools: () => this._refreshToolRegistry(),
 				getCommands,
+				executeCommand: (name, args) => this.executeCommand(name, args),
 				setModel: async (model) => {
 					if (!this.modelRegistry.hasConfiguredAuth(model)) return false;
 					await this.setModel(model);
