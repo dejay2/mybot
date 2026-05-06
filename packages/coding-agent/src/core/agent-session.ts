@@ -310,6 +310,12 @@ export class AgentSession {
 	private _baseSystemPrompt = "";
 	private _baseSystemPromptOptions!: BuildSystemPromptOptions;
 
+	// Optional dispatcher for built-in slash commands (/new, /compact, ...).
+	// Built-ins are owned by the active mode (typically InteractiveMode), so the
+	// mode registers a dispatcher here to make them invokable via executeCommand.
+	// Returns true if the command name was handled.
+	private _builtinDispatcher?: (name: string, args: string) => Promise<boolean>;
+
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
@@ -1114,14 +1120,30 @@ export class AgentSession {
 	 * Try to execute an extension command. Returns true if command was found and executed.
 	 */
 	/**
+	 * Register a dispatcher that handles built-in slash commands (/new, /compact, …).
+	 * Called by the active mode (e.g. InteractiveMode) during init. AgentSession
+	 * itself doesn't own the built-in handlers, so this is the bridge that makes
+	 * them reachable via executeCommand.
+	 */
+	setBuiltinDispatcher(dispatcher: (name: string, args: string) => Promise<boolean>): void {
+		this._builtinDispatcher = dispatcher;
+	}
+
+	/**
 	 * Programmatically dispatch a registered slash command by name.
 	 * Exposed to extensions as `pi.executeCommand(name, args?)`. Resolves to
-	 * true when handled, false when no command with that name is registered.
+	 * true when handled, false when nothing matches. Tries extension-registered
+	 * commands first, then falls back to the mode-registered built-in dispatcher
+	 * if one is set.
 	 */
 	async executeCommand(name: string, args?: string): Promise<boolean> {
 		const trimmed = name.startsWith("/") ? name.slice(1) : name;
 		const text = args && args.length > 0 ? `/${trimmed} ${args}` : `/${trimmed}`;
-		return this._tryExecuteExtensionCommand(text);
+		if (await this._tryExecuteExtensionCommand(text)) return true;
+		if (this._builtinDispatcher) {
+			return this._builtinDispatcher(trimmed, args ?? "");
+		}
+		return false;
 	}
 
 	private async _tryExecuteExtensionCommand(text: string): Promise<boolean> {

@@ -1539,6 +1539,47 @@ export class InteractiveMode {
 		setRegisteredThemes(this.session.resourceLoader.getThemes().themes);
 		this.setupAutocompleteProvider();
 
+		// Expose interactive-mode-owned built-ins to AgentSession.executeCommand so
+		// extensions (e.g. the Telegram bridge) can dispatch /new, /compact, /reload
+		// etc. without going through the TUI submit handler. UI-bound built-ins
+		// (/settings, /model, /login, …) are deliberately omitted: they open
+		// selectors that have no remote affordance, and the caller is expected to
+		// handle them out-of-band.
+		this.session.setBuiltinDispatcher(async (name: string, args: string) => {
+			const argText = args.length > 0 ? `/${name} ${args}` : `/${name}`;
+			switch (name) {
+				case "new":
+					await this.handleClearCommand();
+					return true;
+				case "compact":
+					await this.handleCompactCommand(args.length > 0 ? args : undefined);
+					return true;
+				case "reload":
+					await this.handleReloadCommand();
+					return true;
+				case "quit":
+					await this.shutdown();
+					return true;
+				case "name":
+					this.handleNameCommand(argText);
+					return true;
+				case "copy":
+					await this.handleCopyCommand();
+					return true;
+				case "share":
+					await this.handleShareCommand();
+					return true;
+				case "export":
+					await this.handleExportCommand(argText);
+					return true;
+				case "session":
+					this.handleSessionCommand();
+					return true;
+				default:
+					return false;
+			}
+		});
+
 		const extensionRunner = this.session.extensionRunner;
 		this.setupExtensionShortcuts(extensionRunner);
 		this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
