@@ -1,34 +1,40 @@
 #!/usr/bin/env bash
-# setup.sh — bootstrap a new mybot instance from a fresh clone.
+# setup.sh — bootstrap a self-contained mybot instance from a fresh clone.
 #
 # What it does:
-#   1. Builds the pi binary and installs it under ~/.local/share/pi/.
-#   2. Symlinks the local packages/telegram-bot/ checkout into pi's extension
-#      cache (~/.pi/agent/git/...) so pi loads the extension straight from this
-#      repo instead of cloning from GitHub. NOTE: pi runs `git pull` on /reload;
-#      a future loader change will make this symlink hack unnecessary.
-#   3. Writes the Telegram config at the chosen path.
+#   1. npm install + build the pi binary (lives at packages/coding-agent/dist/pi).
+#   2. Creates ./runtime/agent/ as pi's data dir (sessions, auth, models, etc.).
+#   3. Symlinks ./packages/telegram-bot/ into runtime/agent/git/... so pi loads
+#      the extension straight from this repo.
+#   4. Writes the Telegram config at ./runtime/agent/telegram.json.
+#
+# After setup, run the bot via ./start.sh (which sets PI_CODING_AGENT_DIR and
+# launches the binary from dist/). Everything stays inside the repo dir —
+# nothing under ~/.local/, nothing under ~/.pi/.
 #
 # Usage:
-#   ./setup.sh --bot-token <TOKEN> --user-id <NUMERIC_USER_ID> [--config <PATH>]
+#   ./setup.sh --bot-token <TOKEN> --user-id <NUMERIC_USER_ID>
 #
 # Required:
 #   --bot-token   Bot token from BotFather.
-#   --user-id     Numeric Telegram user id of the user authorized to use the bot.
+#   --user-id     Numeric Telegram user id authorized to use the bot.
 # Optional:
-#   --config      Path to write the config JSON. Default: ~/.pi/agent/telegram.json
+#   --skip-build  Reuse existing dist/pi (don't rebuild).
+#   --skip-install Reuse existing node_modules (don't run npm install).
 set -euo pipefail
 
 BOT_TOKEN=""
 USER_ID=""
-CONFIG_PATH="$HOME/.pi/agent/telegram.json"
+SKIP_BUILD=0
+SKIP_INSTALL=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --bot-token) BOT_TOKEN="$2"; shift 2 ;;
     --user-id) USER_ID="$2"; shift 2 ;;
-    --config) CONFIG_PATH="$2"; shift 2 ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    --skip-build) SKIP_BUILD=1; shift ;;
+    --skip-install) SKIP_INSTALL=1; shift ;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -41,25 +47,31 @@ fi
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$REPO_ROOT"
 
-echo "==> installing dependencies"
-npm install
+if [[ "$SKIP_INSTALL" = "0" ]]; then
+  echo "==> npm install"
+  npm install
+fi
 
-echo "==> building pi binary"
-( cd packages/coding-agent && npm run build:binary )
+if [[ "$SKIP_BUILD" = "0" ]]; then
+  echo "==> building pi binary"
+  ( cd packages/coding-agent && npm run build:binary )
+fi
 
-LOCAL_PI_DIR="$HOME/.local/share/pi"
-mkdir -p "$LOCAL_PI_DIR" "$HOME/.local/bin"
-cp packages/coding-agent/dist/pi "$LOCAL_PI_DIR/pi"
-cp packages/coding-agent/dist/package.json "$LOCAL_PI_DIR/package.json"
-ln -sf "$LOCAL_PI_DIR/pi" "$HOME/.local/bin/pi"
-echo "    pi installed at $LOCAL_PI_DIR/pi (symlinked to ~/.local/bin/pi)"
+if [[ ! -x packages/coding-agent/dist/pi ]]; then
+  echo "error: packages/coding-agent/dist/pi missing or not executable" >&2
+  exit 1
+fi
 
-EXTENSION_CACHE_DIR="$HOME/.pi/agent/git/github.com/dejay2/mybot-telegram-bot"
+RUNTIME_DIR="$REPO_ROOT/runtime/agent"
+mkdir -p "$RUNTIME_DIR"
+echo "    runtime dir: $RUNTIME_DIR"
+
+EXTENSION_CACHE_DIR="$RUNTIME_DIR/git/github.com/dejay2/mybot-telegram-bot"
 mkdir -p "$(dirname "$EXTENSION_CACHE_DIR")"
 ln -sfn "$REPO_ROOT/packages/telegram-bot" "$EXTENSION_CACHE_DIR"
-echo "    telegram-bot extension symlinked at $EXTENSION_CACHE_DIR"
+echo "    telegram-bot extension symlinked at runtime/agent/git/.../mybot-telegram-bot"
 
-mkdir -p "$(dirname "$CONFIG_PATH")"
+CONFIG_PATH="$RUNTIME_DIR/telegram.json"
 cat > "$CONFIG_PATH" <<EOF
 {
 	"botToken": "$BOT_TOKEN",
@@ -72,4 +84,4 @@ echo "    config written to $CONFIG_PATH"
 
 echo ""
 echo "done. start the bot with:"
-echo "    PI_TELEGRAM_CONFIG=$CONFIG_PATH pi"
+echo "    ./start.sh"
