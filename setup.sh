@@ -109,8 +109,17 @@ mkdir -p \
   "$RUNTIME_DIR/memory" \
   "$REPO_ROOT/runtime/bin" \
   "$REPO_ROOT/runtime/cache" \
-  "$REPO_ROOT/runtime/qmd-config"
+  "$REPO_ROOT/runtime/qmd-config" \
+  "$REPO_ROOT/runtime/control" \
+  "$REPO_ROOT/runtime/log"
 echo "    runtime dir: $RUNTIME_DIR"
+
+# Seed an empty cron schedule so scripts/gateway.ts can run with no tasks.
+CRON_PATH="$REPO_ROOT/runtime/cron.json"
+if [[ ! -f "$CRON_PATH" ]]; then
+  echo '{"tasks":[]}' > "$CRON_PATH"
+  echo "    cron file:  $CRON_PATH (empty)"
+fi
 
 # Symlink the renamed binary. Relative target survives `cp -r runtime/` and
 # `tar`-and-move; the resolved exe path is dist/pi (so pi finds its

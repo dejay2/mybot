@@ -1,4 +1,4 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -178,6 +178,163 @@ const PREVIEW_THROTTLE_MS = 750;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
 
+// ============================================================================
+// Gateway integration
+// ============================================================================
+//
+// When the bot runs under scripts/gateway.ts (the supervisor), three control
+// surfaces are visible to this extension:
+//   - runtime/control/restart        — touched to ask the gateway to bounce pi
+//   - runtime/control/run-<taskId>   — touched to fire one cron task immediately
+//   - runtime/gateway.health         — heartbeat JSON written by the gateway
+//   - runtime/cron.json              — schedule + per-task state
+//
+// Paths are resolved off PI_CODING_AGENT_DIR (set to <runtime>/agent by both
+// start.sh and gateway.ts), so the runtime dir is always its parent. If this
+// extension is loaded outside the mybot layout (e.g. ~/.pi/agent), the gateway
+// commands degrade with a clear "gateway not running" message.
+
+interface GatewayPaths {
+	runtimeDir: string;
+	controlDir: string;
+	healthPath: string;
+	cronPath: string;
+}
+
+function resolveGatewayPaths(): GatewayPaths {
+	const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+	const runtimeDir = dirname(agentDir);
+	return {
+		runtimeDir,
+		controlDir: join(runtimeDir, "control"),
+		healthPath: join(runtimeDir, "gateway.health"),
+		cronPath: join(runtimeDir, "cron.json"),
+	};
+}
+
+interface GatewayHealth {
+	gatewayPid?: number;
+	gatewayStartedAt?: string;
+	piPid?: number | null;
+	piStartedAt?: string | null;
+	piState?: string;
+	lastHealthOk?: string | null;
+	restartCount?: number;
+	cron?: {
+		nextFire?: string | null;
+		nextFireTaskId?: string | null;
+		lastRun?: { id: string; at: string; status: "ok" | "error" } | null;
+		runningTaskIds?: string[];
+	};
+}
+
+interface CronTask {
+	id: string;
+	schedule: string;
+	prompt: string;
+	enabled: boolean;
+	lastRun?: string | null;
+	lastStatus?: "ok" | "error" | null;
+	lastError?: string | null;
+}
+
+interface CronFile {
+	tasks: CronTask[];
+}
+
+async function readGatewayHealth(paths: GatewayPaths): Promise<GatewayHealth | null> {
+	try {
+		return JSON.parse(await readFile(paths.healthPath, "utf8"));
+	} catch {
+		return null;
+	}
+}
+
+async function readCronFileSafe(paths: GatewayPaths): Promise<CronFile> {
+	try {
+		const parsed = JSON.parse(await readFile(paths.cronPath, "utf8"));
+		if (!parsed || !Array.isArray(parsed.tasks)) return { tasks: [] };
+		return parsed as CronFile;
+	} catch {
+		return { tasks: [] };
+	}
+}
+
+async function writeCronFileAtomic(paths: GatewayPaths, file: CronFile): Promise<void> {
+	const tmp = `${paths.cronPath}.tmp`;
+	await writeFile(tmp, `${JSON.stringify(file, null, "\t")}\n`, "utf8");
+	await rename(tmp, paths.cronPath);
+}
+
+function isValidCronExpr(expr: string): boolean {
+	const parts = expr.trim().split(/\s+/);
+	if (parts.length !== 5) return false;
+	const ranges: Array<[number, number]> = [
+		[0, 59], [0, 23], [1, 31], [1, 12], [0, 6],
+	];
+	for (let i = 0; i < 5; i++) {
+		const [min, max] = ranges[i];
+		for (const part of parts[i].split(",")) {
+			const [rangeStr, stepStr] = part.includes("/") ? part.split("/") : [part, "1"];
+			if (!/^\d+$/.test(stepStr) || Number.parseInt(stepStr, 10) < 1) return false;
+			if (rangeStr === "*") continue;
+			if (rangeStr.includes("-")) {
+				const [a, b] = rangeStr.split("-");
+				if (!/^\d+$/.test(a) || !/^\d+$/.test(b)) return false;
+				const lo = Number.parseInt(a, 10);
+				const hi = Number.parseInt(b, 10);
+				if (lo < min || hi > max || lo > hi) return false;
+			} else if (/^\d+$/.test(rangeStr)) {
+				const v = Number.parseInt(rangeStr, 10);
+				if (v < min || v > max) return false;
+			} else {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+function isValidCronTaskId(id: string): boolean {
+	return /^[a-z0-9][a-z0-9_-]{0,63}$/.test(id);
+}
+
+function formatHealth(health: GatewayHealth | null): string {
+	if (!health) return "Gateway not running (no runtime/gateway.health found).";
+	const lines: string[] = [];
+	lines.push(`gateway pid: ${health.gatewayPid ?? "?"} (since ${health.gatewayStartedAt ?? "?"})`);
+	lines.push(`pi pid: ${health.piPid ?? "?"} (state: ${health.piState ?? "?"})`);
+	lines.push(`last health ok: ${health.lastHealthOk ?? "never"}`);
+	lines.push(`restart count: ${health.restartCount ?? 0}`);
+	const cron = health.cron;
+	if (cron) {
+		if (cron.nextFire && cron.nextFireTaskId) {
+			lines.push(`next cron: ${cron.nextFireTaskId} @ ${cron.nextFire}`);
+		} else {
+			lines.push("next cron: (none scheduled)");
+		}
+		if (cron.lastRun) {
+			lines.push(`last cron: ${cron.lastRun.id} @ ${cron.lastRun.at} (${cron.lastRun.status})`);
+		}
+		if (cron.runningTaskIds && cron.runningTaskIds.length > 0) {
+			lines.push(`running: ${cron.runningTaskIds.join(", ")}`);
+		}
+	}
+	return lines.join("\n");
+}
+
+function formatCronList(file: CronFile): string {
+	if (file.tasks.length === 0) return "No scheduled tasks. Add one with /cron add <id> <expr5> <prompt>";
+	const lines: string[] = [];
+	for (const task of file.tasks) {
+		const tag = task.enabled ? "" : " [disabled]";
+		const last = task.lastRun ? ` (last: ${task.lastRun} ${task.lastStatus ?? "?"})` : "";
+		lines.push(`${task.id}${tag}: ${task.schedule}${last}`);
+		lines.push(`  ${task.prompt}`);
+	}
+	return lines.join("\n");
+}
+
 const SYSTEM_PROMPT_SUFFIX = `
 
 Telegram bridge extension is active.
@@ -315,6 +472,13 @@ export default function (pi: ExtensionAPI) {
 	let previewState: TelegramPreviewState | undefined;
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
 	let nextDraftId = 0;
+	// Set by the slash-command dispatcher right before invoking pi.executeCommand,
+	// so gateway-aware command handlers (/restart, /health, /cron) can reply
+	// directly to the originating Telegram message instead of relying on the
+	// generic post-dispatch ack. Cleared in the dispatcher's finally block.
+	let pendingTelegramCommandReply:
+		| { chatId: number; messageId: number; suppressAck: boolean }
+		| undefined;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
 	// chatId -> { models, messageId, page } for pending model picker keyboards
 	const pendingModelSelections = new Map<
@@ -1138,15 +1302,23 @@ export default function (pi: ExtensionAPI) {
 						default: return `✓ /${name} done.`;
 					}
 				};
+				// Gateway-aware commands send their own structured replies via
+				// `pendingTelegramCommandReply`. Skip the generic ack for them.
+				pendingTelegramCommandReply = {
+					chatId: firstMessage.chat.id,
+					messageId: firstMessage.message_id,
+					suppressAck: false,
+				};
 				try {
 					const handled = await exec(piName, cmdArgs);
+					const suppressAck = pendingTelegramCommandReply?.suppressAck ?? false;
 					if (!handled) {
 						await sendTextReply(
 							firstMessage.chat.id,
 							firstMessage.message_id,
 							`/${piName} is no longer registered.`,
 						);
-					} else {
+					} else if (!suppressAck) {
 						const ack = ackMessage(piName);
 						if (ack) {
 							await sendTextReply(firstMessage.chat.id, firstMessage.message_id, ack);
@@ -1159,6 +1331,8 @@ export default function (pi: ExtensionAPI) {
 						firstMessage.message_id,
 						`/${piName} failed: ${message}`,
 					);
+				} finally {
+					pendingTelegramCommandReply = undefined;
 				}
 				return;
 			}
@@ -1578,6 +1752,137 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// ========================================================================
+	// Gateway commands: /restart, /health, /cron
+	// ========================================================================
+	//
+	// These commands talk to the supervisor (scripts/gateway.ts) via filesystem
+	// sentinels in runtime/control/ and the heartbeat at runtime/gateway.health.
+	// They do NOT need an RPC channel back to the gateway — the gateway watches
+	// the control dir at 1Hz and the cron file's mtime each tick.
+
+	const replyToCommand = async (text: string): Promise<void> => {
+		const reply = pendingTelegramCommandReply;
+		if (!reply) return;
+		reply.suppressAck = true;
+		await sendTextReply(reply.chatId, reply.messageId, text);
+	};
+
+	pi.registerCommand("restart", {
+		description: "Restart the bot via the gateway supervisor",
+		handler: async (_args, _ctx) => {
+			const paths = resolveGatewayPaths();
+			const health = await readGatewayHealth(paths);
+			if (!health) {
+				await replyToCommand(
+					"Gateway not running — start the bot via ./start.sh so the supervisor is in charge.",
+				);
+				return;
+			}
+			try {
+				await mkdir(paths.controlDir, { recursive: true });
+				await writeFile(join(paths.controlDir, "restart"), `${new Date().toISOString()}\n`, "utf8");
+				await replyToCommand("Restart requested. Bot will respawn shortly.");
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				await replyToCommand(`Restart request failed: ${msg}`);
+			}
+		},
+	});
+
+	pi.registerCommand("health", {
+		description: "Show gateway + bot health",
+		handler: async (_args, _ctx) => {
+			const paths = resolveGatewayPaths();
+			const health = await readGatewayHealth(paths);
+			await replyToCommand(formatHealth(health));
+		},
+	});
+
+	pi.registerCommand("cron", {
+		description: "Manage scheduled tasks (list | add <id> <expr5> <prompt> | rm <id> | run <id> | enable <id> | disable <id>)",
+		handler: async (args, _ctx) => {
+			const paths = resolveGatewayPaths();
+			const trimmed = args.trim();
+			if (!trimmed || trimmed === "list") {
+				const file = await readCronFileSafe(paths);
+				await replyToCommand(formatCronList(file));
+				return;
+			}
+			const [verb, ...rest] = trimmed.split(/\s+/);
+			const file = await readCronFileSafe(paths);
+			switch (verb) {
+				case "add": {
+					if (rest.length < 7) {
+						await replyToCommand("Usage: /cron add <id> <m> <h> <dom> <mon> <dow> <prompt>");
+						return;
+					}
+					const [id, ...tail] = rest;
+					if (!isValidCronTaskId(id)) {
+						await replyToCommand("Bad task id. Allowed: lowercase alnum, _ or - (max 64).");
+						return;
+					}
+					if (file.tasks.some((t) => t.id === id)) {
+						await replyToCommand(`Task "${id}" already exists. Use /cron rm ${id} first.`);
+						return;
+					}
+					const schedule = tail.slice(0, 5).join(" ");
+					if (!isValidCronExpr(schedule)) {
+						await replyToCommand(`Bad cron expression: "${schedule}". Standard 5 fields: m h dom mon dow.`);
+						return;
+					}
+					const prompt = tail.slice(5).join(" ").trim();
+					if (!prompt) {
+						await replyToCommand("Empty prompt. Provide the prompt after the 5 cron fields.");
+						return;
+					}
+					file.tasks.push({ id, schedule, prompt, enabled: true });
+					await writeCronFileAtomic(paths, file);
+					await replyToCommand(`Added task "${id}" (${schedule}). Edit runtime/cron.json to tweak.`);
+					return;
+				}
+				case "rm": {
+					const id = rest[0];
+					if (!id) { await replyToCommand("Usage: /cron rm <id>"); return; }
+					const before = file.tasks.length;
+					file.tasks = file.tasks.filter((t) => t.id !== id);
+					if (file.tasks.length === before) { await replyToCommand(`No task "${id}".`); return; }
+					await writeCronFileAtomic(paths, file);
+					await replyToCommand(`Removed task "${id}".`);
+					return;
+				}
+				case "run": {
+					const id = rest[0];
+					if (!id) { await replyToCommand("Usage: /cron run <id>"); return; }
+					if (!file.tasks.some((t) => t.id === id)) { await replyToCommand(`No task "${id}".`); return; }
+					try {
+						await mkdir(paths.controlDir, { recursive: true });
+						await writeFile(join(paths.controlDir, `run-${id}`), `${new Date().toISOString()}\n`, "utf8");
+						await replyToCommand(`Triggered "${id}". Result will arrive when the task finishes.`);
+					} catch (err) {
+						const msg = err instanceof Error ? err.message : String(err);
+						await replyToCommand(`Trigger failed: ${msg}`);
+					}
+					return;
+				}
+				case "enable":
+				case "disable": {
+					const id = rest[0];
+					if (!id) { await replyToCommand(`Usage: /cron ${verb} <id>`); return; }
+					const task = file.tasks.find((t) => t.id === id);
+					if (!task) { await replyToCommand(`No task "${id}".`); return; }
+					task.enabled = verb === "enable";
+					await writeCronFileAtomic(paths, file);
+					await replyToCommand(`Task "${id}" ${verb}d.`);
+					return;
+				}
+				default:
+					await replyToCommand(
+						"Unknown subcommand. Use: list | add <id> <expr5> <prompt> | rm <id> | run <id> | enable <id> | disable <id>",
+					);
+			}
+		},
+	});
 	pi.on("session_start", async (_event, ctx) => {
 		config = await readConfig();
 		await mkdir(TEMP_DIR, { recursive: true });
