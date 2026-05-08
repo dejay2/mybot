@@ -1238,11 +1238,21 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		if (lower === "/new") {
+			if (!ctx.isIdle()) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot start a new session while pi is busy. Send \"stop\" first.");
+				return;
+			}
+			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Starting a new pi session...");
+			await pi.executeCommand("new");
+			return;
+		}
+
 		if (lower === "/help" || lower === "/start") {
 			await sendTextReply(
 				firstMessage.chat.id,
 				firstMessage.message_id,
-				`Send me a message and I will forward it to pi.\nTap the Menu button to browse pi's slash commands — type / to filter.\nRunnable from Telegram: /model, /status, /compact, /stop (or "stop"). Other menu entries are listed for reference; run them from the pi TUI.`,
+				`Send me a message and I will forward it to pi.\nTap the Menu button to browse pi's slash commands — type / to filter.\nRunnable from Telegram: /model, /status, /compact, /new, /stop (or "stop"). Other menu entries are listed for reference; run them from the pi TUI.`,
 			);
 			if (config.allowedUserId === undefined && firstMessage.from) {
 				config.allowedUserId = firstMessage.from.id;
