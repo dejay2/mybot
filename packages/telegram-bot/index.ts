@@ -3,7 +3,7 @@ import { basename, dirname, extname, join } from "node:path";
 import { homedir } from "node:os";
 
 import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
+import type { AgentMessage, ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
@@ -177,6 +177,58 @@ const MAX_ATTACHMENTS_PER_TURN = 10;
 const PREVIEW_THROTTLE_MS = 750;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
+
+// Thinking-level UI. Levels are clamped per-model by pi.setThinkingLevel; we
+// always show all 6 buttons so the user can ask for "high" on a model that
+// only supports "medium" — pi will silently land them on the closest available.
+const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+const THINKING_LEVEL_LABELS: Record<ThinkingLevel, string> = {
+	off: "Off",
+	minimal: "Minimal",
+	low: "Low",
+	medium: "Medium",
+	high: "High",
+	xhigh: "Extra high",
+};
+
+// Inline-prefix display for assistant thinking blocks. When pi's thinking
+// level is non-off, assistant messages contain `{ type: "thinking", thinking }`
+// blocks alongside the final text. We render them as a one-shot prefix so the
+// user can see the model's reasoning without wading through it. Cap and
+// middle-elide to stay well below Telegram's 4096-char message limit.
+const THINKING_INLINE_HEADER = "🧠 thinking";
+const THINKING_INLINE_SEPARATOR = "─────";
+const THINKING_INLINE_BUDGET = 1500;
+
+function truncateThinking(text: string): string {
+	if (text.length <= THINKING_INLINE_BUDGET) return text;
+	const half = Math.floor((THINKING_INLINE_BUDGET - 20) / 2);
+	return `${text.slice(0, half)}\n[…elided…]\n${text.slice(text.length - half)}`;
+}
+
+function extractMessageBlocks(message: AgentMessage): { thinking: string; text: string } {
+	const value = message as unknown as Record<string, unknown>;
+	const content = Array.isArray(value.content) ? value.content : [];
+	let thinking = "";
+	let text = "";
+	for (const raw of content) {
+		if (typeof raw !== "object" || raw === null || !("type" in raw)) continue;
+		const block = raw as { type: string; text?: string; thinking?: string; redacted?: boolean };
+		if (block.type === "thinking" && typeof block.thinking === "string" && !block.redacted) {
+			thinking += block.thinking;
+		} else if (block.type === "text" && typeof block.text === "string") {
+			text += block.text;
+		}
+	}
+	return { thinking: thinking.trim(), text: text.trim() };
+}
+
+function formatMessageWithThinking(blocks: { thinking: string; text: string }): string {
+	if (!blocks.thinking) return blocks.text;
+	const truncated = truncateThinking(blocks.thinking);
+	if (!blocks.text) return `${THINKING_INLINE_HEADER}\n${truncated}`;
+	return `${THINKING_INLINE_HEADER}\n${truncated}\n\n${THINKING_INLINE_SEPARATOR}\n\n${blocks.text}`;
+}
 
 // ============================================================================
 // Gateway integration
@@ -494,6 +546,8 @@ export default function (pi: ExtensionAPI) {
 			page: number;
 		}
 	>();
+	// chatId -> messageId for pending /thinking picker keyboards
+	const pendingThinkingSelections = new Map<number, { messageId: number }>();
 
 	function allocateDraftId(): number {
 		nextDraftId = nextDraftId >= TELEGRAM_DRAFT_ID_MAX ? 1 : nextDraftId + 1;
@@ -715,14 +769,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function getMessageText(message: AgentMessage): string {
-		const value = message as unknown as Record<string, unknown>;
-		const content = Array.isArray(value.content) ? value.content : [];
-		return content
-			.filter((block): block is { type: string; text?: string } => typeof block === "object" && block !== null && "type" in block)
-			.filter((block) => block.type === "text" && typeof block.text === "string")
-			.map((block) => block.text as string)
-			.join("")
-			.trim();
+		return formatMessageWithThinking(extractMessageBlocks(message));
 	}
 
 	async function clearPreview(chatId: number): Promise<void> {
@@ -842,14 +889,8 @@ export default function (pi: ExtensionAPI) {
 			if (message.role !== "assistant") continue;
 			const stopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
 			const errorMessage = typeof message.errorMessage === "string" ? message.errorMessage : undefined;
-			const content = Array.isArray(message.content) ? message.content : [];
-			const text = content
-				.filter((block): block is { type: string; text?: string } => typeof block === "object" && block !== null && "type" in block)
-				.filter((block) => block.type === "text" && typeof block.text === "string")
-				.map((block) => block.text as string)
-				.join("")
-				.trim();
-			return { text: text || undefined, stopReason, errorMessage };
+			const formatted = formatMessageWithThinking(extractMessageBlocks(messages[i]));
+			return { text: formatted || undefined, stopReason, errorMessage };
 		}
 		return {};
 	}
@@ -1103,6 +1144,7 @@ export default function (pi: ExtensionAPI) {
 			if (ctx.model) {
 				lines.push(`Model: ${ctx.model.provider}/${ctx.model.id}`);
 			}
+			lines.push(`Thinking: ${THINKING_LEVEL_LABELS[pi.getThinkingLevel()]}`);
 			const tokenParts: string[] = [];
 			if (totalInput) tokenParts.push(`↑${formatTokens(totalInput)}`);
 			if (totalOutput) tokenParts.push(`↓${formatTokens(totalOutput)}`);
@@ -1238,6 +1280,42 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		if (lower === "/thinking" || lower.startsWith("/thinking ")) {
+			const arg = lower === "/thinking" ? undefined : rawText.slice("/thinking ".length).trim();
+			const chatId = firstMessage.chat.id;
+			const messageId = firstMessage.message_id;
+			const currentLevel = pi.getThinkingLevel();
+			if (arg) {
+				const requested = arg.toLowerCase() as ThinkingLevel;
+				if (!THINKING_LEVELS.includes(requested)) {
+					await sendTextReply(
+						chatId,
+						messageId,
+						`Unknown level "${arg}". Pick one of: ${THINKING_LEVELS.join(", ")}.`,
+					);
+					return;
+				}
+				try {
+					pi.setThinkingLevel(requested);
+				} catch (error) {
+					const m = error instanceof Error ? error.message : String(error);
+					await sendTextReply(chatId, messageId, `Failed to set thinking level: ${m}`);
+					return;
+				}
+				const after = pi.getThinkingLevel();
+				const change = currentLevel === after ? "" : ` (was ${THINKING_LEVEL_LABELS[currentLevel]})`;
+				const note =
+					after === requested
+						? `Thinking level: ${THINKING_LEVEL_LABELS[after]}${change}.`
+						: `Requested ${THINKING_LEVEL_LABELS[requested]}; the current model only supports up to ${THINKING_LEVEL_LABELS[after]}${change}.`;
+				await sendTextReply(chatId, messageId, note);
+				return;
+			}
+			pendingThinkingSelections.set(chatId, { messageId });
+			await renderThinkingPicker(chatId, messageId, currentLevel);
+			return;
+		}
+
 		if (lower === "/new") {
 			if (!ctx.isIdle()) {
 				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot start a new session while pi is busy. Send \"stop\" first.");
@@ -1252,7 +1330,7 @@ export default function (pi: ExtensionAPI) {
 			await sendTextReply(
 				firstMessage.chat.id,
 				firstMessage.message_id,
-				`Send me a message and I will forward it to pi.\nTap the Menu button to browse pi's slash commands — type / to filter.\nRunnable from Telegram: /model, /status, /compact, /new, /stop (or "stop"). Other menu entries are listed for reference; run them from the pi TUI.`,
+				`Send me a message and I will forward it to pi.\nTap the Menu button to browse pi's slash commands — type / to filter.\nRunnable from Telegram: /model, /thinking, /status, /compact, /new, /stop (or "stop"), /restart, /health, /cron. Other menu entries are listed for reference; run them from the pi TUI.`,
 			);
 			if (config.allowedUserId === undefined && firstMessage.from) {
 				config.allowedUserId = firstMessage.from.id;
@@ -1553,6 +1631,106 @@ export default function (pi: ExtensionAPI) {
 		return false;
 	}
 
+	function buildThinkingKeyboard(currentLevel: ThinkingLevel): {
+		text: string;
+		keyboard: Array<Array<{ text: string; callback_data: string }>>;
+	} {
+		const headerLines = [
+			"Thinking level",
+			`Current: ${THINKING_LEVEL_LABELS[currentLevel]}`,
+			"",
+			"pi clamps the choice to whatever the active model supports.",
+		];
+		// Two columns: less spammy than 6 vertical buttons, still tappable on mobile.
+		const keyboard: Array<Array<{ text: string; callback_data: string }>> = [];
+		for (let i = 0; i < THINKING_LEVELS.length; i += 2) {
+			const row: Array<{ text: string; callback_data: string }> = [];
+			for (const level of THINKING_LEVELS.slice(i, i + 2)) {
+				const isCurrent = level === currentLevel;
+				const label = `${isCurrent ? "✅ " : ""}${THINKING_LEVEL_LABELS[level]}`;
+				row.push({ text: label, callback_data: `thinking:${level}` });
+			}
+			keyboard.push(row);
+		}
+		keyboard.push([{ text: "❌ Cancel", callback_data: "thinking:cancel" }]);
+		return { text: headerLines.join("\n"), keyboard };
+	}
+
+	async function renderThinkingPicker(
+		chatId: number,
+		_originalMessageId: number,
+		currentLevel: ThinkingLevel,
+		editMessageId?: number,
+	): Promise<void> {
+		const { text, keyboard } = buildThinkingKeyboard(currentLevel);
+		try {
+			if (editMessageId !== undefined) {
+				await callTelegram<TelegramSentMessage>("editMessageText", {
+					chat_id: chatId,
+					message_id: editMessageId,
+					text,
+					reply_markup: { inline_keyboard: keyboard },
+				});
+			} else {
+				const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
+					chat_id: chatId,
+					text,
+					reply_markup: { inline_keyboard: keyboard },
+				});
+				const pending = pendingThinkingSelections.get(chatId);
+				if (pending) pending.messageId = sent.message_id;
+			}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			await sendTextReply(chatId, _originalMessageId, `Failed to show thinking picker: ${message}`);
+		}
+	}
+
+	async function handleThinkingCallback(
+		callbackQueryId: string,
+		chatId: number,
+		keyboardMessageId: number,
+		data: string,
+	): Promise<boolean> {
+		try {
+			await callTelegram<TelegramCallbackAnswer>("answerCallbackQuery", { callback_query_id: callbackQueryId });
+		} catch {
+			// ignore
+		}
+
+		const pending = pendingThinkingSelections.get(chatId);
+		if (!pending) return false;
+
+		if (data === "thinking:cancel") {
+			pendingThinkingSelections.delete(chatId);
+			await replyAndCleanup(chatId, keyboardMessageId, "Thinking-level picker cancelled.");
+			return true;
+		}
+
+		if (!data.startsWith("thinking:")) return false;
+		const requested = data.slice("thinking:".length) as ThinkingLevel;
+		if (!THINKING_LEVELS.includes(requested)) return true;
+
+		const before = pi.getThinkingLevel();
+		try {
+			pi.setThinkingLevel(requested);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			pendingThinkingSelections.delete(chatId);
+			await replyAndCleanup(chatId, keyboardMessageId, `Failed to set thinking level: ${message}`);
+			return true;
+		}
+		const after = pi.getThinkingLevel();
+		pendingThinkingSelections.delete(chatId);
+		const note =
+			after === requested
+				? `Thinking level: ${THINKING_LEVEL_LABELS[after]}.`
+				: `Requested ${THINKING_LEVEL_LABELS[requested]}; the current model only supports up to ${THINKING_LEVEL_LABELS[after]}.`;
+		const change = before === after ? "" : ` (was ${THINKING_LEVEL_LABELS[before]})`;
+		await replyAndCleanup(chatId, keyboardMessageId, `${note}${change}`);
+		return true;
+	}
+
 	async function handleAuthorizedTelegramMessage(message: TelegramMessage, ctx: ExtensionContext): Promise<void> {
 		if (message.media_group_id) {
 			const key = `${message.chat.id}:${message.media_group_id}`;
@@ -1579,6 +1757,15 @@ export default function (pi: ExtensionAPI) {
 			if (cq.from && cq.from.id !== config.allowedUserId) return;
 
 			if (cq.data && cq.message) {
+				if (cq.data.startsWith("thinking:")) {
+					const handled = await handleThinkingCallback(
+						cq.id,
+						cq.message.chat.id,
+						cq.message.message_id,
+						cq.data,
+					);
+					if (handled) return;
+				}
 				const handled = await handleModelCallback(
 					cq.id,
 					cq.message.chat.id,
