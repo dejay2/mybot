@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 
 import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
 import type { AgentMessage, ThinkingLevel } from "@mariozechner/pi-agent-core";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
 interface TelegramConfig {
@@ -177,6 +177,7 @@ const MAX_ATTACHMENTS_PER_TURN = 10;
 const PREVIEW_THROTTLE_MS = 750;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
+const UI_PROMPT_TIMEOUT_MS = 5 * 60_000;
 
 // Thinking-level UI. Levels are clamped per-model by pi.setThinkingLevel; we
 // always show all 6 buttons so the user can ask for "high" on a model that
@@ -548,6 +549,32 @@ export default function (pi: ExtensionAPI) {
 	>();
 	// chatId -> messageId for pending /thinking picker keyboards
 	const pendingThinkingSelections = new Map<number, { messageId: number }>();
+	// chatId -> in-flight ctx.ui prompt awaiting an answer from Telegram. At most
+	// one prompt per chat. Cleared on answer, cancel, timeout, or session_shutdown.
+	type PendingUiPrompt =
+		| {
+				kind: "confirm";
+				chatId: number;
+				messageId: number;
+				resolve: (v: boolean) => void;
+				timer: ReturnType<typeof setTimeout>;
+		  }
+		| {
+				kind: "select";
+				chatId: number;
+				messageId: number;
+				options: string[];
+				resolve: (v: string | undefined) => void;
+				timer: ReturnType<typeof setTimeout>;
+		  }
+		| {
+				kind: "input";
+				chatId: number;
+				messageId: number;
+				resolve: (v: string | undefined) => void;
+				timer: ReturnType<typeof setTimeout>;
+		  };
+	const pendingUiPrompts = new Map<number, PendingUiPrompt>();
 
 	function allocateDraftId(): number {
 		nextDraftId = nextDraftId >= TELEGRAM_DRAFT_ID_MAX ? 1 : nextDraftId + 1;
@@ -1731,7 +1758,216 @@ export default function (pi: ExtensionAPI) {
 		return true;
 	}
 
+	// ========================================================================
+	// ctx.ui bridge: route confirm/select/input/custom calls through Telegram
+	// when an extension prompts during a Telegram-driven turn. Falls through to
+	// the original UI when no Telegram turn is active (e.g. /telegram-setup
+	// invoked at the pi TUI). `custom` (full TUI overlays) is rejected with a
+	// note instead of hanging headlessly.
+	// ========================================================================
+
+	function getActiveTelegramChatId(): number | undefined {
+		return activeTelegramTurn?.chatId ?? queuedTelegramTurns[0]?.chatId;
+	}
+
+	async function stripKeyboardWithReply(chatId: number, messageId: number, replacementText: string): Promise<void> {
+		// Edit the prompt message to show what was answered and drop the keyboard
+		// in one round-trip. If the edit fails (message gone, etc.), we let it go
+		// — leftover buttons are harmless once we stop responding to them.
+		try {
+			await callTelegram("editMessageText", { chat_id: chatId, message_id: messageId, text: replacementText });
+		} catch {
+			// ignore
+		}
+	}
+
+	function evictPendingUiPrompt(chatId: number, replacementText: string): void {
+		const prev = pendingUiPrompts.get(chatId);
+		if (!prev) return;
+		clearTimeout(prev.timer);
+		pendingUiPrompts.delete(chatId);
+		if (prev.kind === "confirm") prev.resolve(false);
+		else prev.resolve(undefined);
+		if (prev.kind !== "input") {
+			void stripKeyboardWithReply(chatId, prev.messageId, replacementText);
+		}
+	}
+
+	function cancelAllPendingUiPrompts(replacementText: string): void {
+		for (const chatId of Array.from(pendingUiPrompts.keys())) {
+			evictPendingUiPrompt(chatId, replacementText);
+		}
+	}
+
+	async function uiConfirmViaTelegram(chatId: number, title: string, message: string): Promise<boolean> {
+		evictPendingUiPrompt(chatId, "Cancelled — superseded by a new prompt.");
+		const text = message ? `${title}\n\n${message}` : title;
+		const keyboard = [[
+			{ text: "✅ Yes", callback_data: "uip:confirm:y" },
+			{ text: "❌ No", callback_data: "uip:confirm:n" },
+		]];
+		let sent: TelegramSentMessage;
+		try {
+			sent = await callTelegram<TelegramSentMessage>("sendMessage", {
+				chat_id: chatId,
+				text,
+				reply_markup: { inline_keyboard: keyboard },
+			});
+		} catch {
+			return false;
+		}
+		return new Promise<boolean>((resolve) => {
+			const timer = setTimeout(() => {
+				const cur = pendingUiPrompts.get(chatId);
+				if (!cur || cur.messageId !== sent.message_id) return;
+				pendingUiPrompts.delete(chatId);
+				void stripKeyboardWithReply(chatId, sent.message_id, `${text}\n\n⏱ Timed out — answered No.`);
+				resolve(false);
+			}, UI_PROMPT_TIMEOUT_MS);
+			pendingUiPrompts.set(chatId, { kind: "confirm", chatId, messageId: sent.message_id, resolve, timer });
+		});
+	}
+
+	async function uiSelectViaTelegram(chatId: number, title: string, options: string[]): Promise<string | undefined> {
+		evictPendingUiPrompt(chatId, "Cancelled — superseded by a new prompt.");
+		// Telegram caps inline keyboards at 100 buttons; reserve one for cancel.
+		const limited = options.slice(0, 96);
+		const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+		for (let i = 0; i < limited.length; i++) {
+			rows.push([{ text: limited[i].slice(0, 64), callback_data: `uip:select:${i}` }]);
+		}
+		rows.push([{ text: "❌ Cancel", callback_data: "uip:cancel" }]);
+		let sent: TelegramSentMessage;
+		const text = title || "Choose an option:";
+		try {
+			sent = await callTelegram<TelegramSentMessage>("sendMessage", {
+				chat_id: chatId,
+				text,
+				reply_markup: { inline_keyboard: rows },
+			});
+		} catch {
+			return undefined;
+		}
+		return new Promise<string | undefined>((resolve) => {
+			const timer = setTimeout(() => {
+				const cur = pendingUiPrompts.get(chatId);
+				if (!cur || cur.messageId !== sent.message_id) return;
+				pendingUiPrompts.delete(chatId);
+				void stripKeyboardWithReply(chatId, sent.message_id, `${text}\n\n⏱ Timed out — selection cancelled.`);
+				resolve(undefined);
+			}, UI_PROMPT_TIMEOUT_MS);
+			pendingUiPrompts.set(chatId, { kind: "select", chatId, messageId: sent.message_id, options: limited, resolve, timer });
+		});
+	}
+
+	async function uiInputViaTelegram(chatId: number, title: string, placeholder?: string): Promise<string | undefined> {
+		evictPendingUiPrompt(chatId, "Cancelled — superseded by a new prompt.");
+		const lines = [title];
+		if (placeholder) lines.push(`(e.g. ${placeholder})`);
+		lines.push("Reply with your answer, or send /cancel.");
+		let sent: TelegramSentMessage;
+		try {
+			sent = await callTelegram<TelegramSentMessage>("sendMessage", {
+				chat_id: chatId,
+				text: lines.join("\n"),
+			});
+		} catch {
+			return undefined;
+		}
+		return new Promise<string | undefined>((resolve) => {
+			const timer = setTimeout(() => {
+				const cur = pendingUiPrompts.get(chatId);
+				if (!cur || cur.messageId !== sent.message_id) return;
+				pendingUiPrompts.delete(chatId);
+				void sendTextReply(chatId, sent.message_id, "⏱ Timed out — input cancelled.").catch(() => {});
+				resolve(undefined);
+			}, UI_PROMPT_TIMEOUT_MS);
+			pendingUiPrompts.set(chatId, { kind: "input", chatId, messageId: sent.message_id, resolve, timer });
+		});
+	}
+
+	async function handleUiPromptCallback(callbackQueryId: string, chatId: number, _keyboardMessageId: number, data: string): Promise<boolean> {
+		if (!data.startsWith("uip:")) return false;
+		try {
+			await callTelegram<TelegramCallbackAnswer>("answerCallbackQuery", { callback_query_id: callbackQueryId });
+		} catch {
+			// ignore
+		}
+		const pending = pendingUiPrompts.get(chatId);
+		if (!pending) return true;
+		if (data === "uip:cancel") {
+			clearTimeout(pending.timer);
+			pendingUiPrompts.delete(chatId);
+			void stripKeyboardWithReply(chatId, pending.messageId, "Cancelled.");
+			if (pending.kind === "confirm") pending.resolve(false);
+			else pending.resolve(undefined);
+			return true;
+		}
+		if (pending.kind === "confirm" && (data === "uip:confirm:y" || data === "uip:confirm:n")) {
+			clearTimeout(pending.timer);
+			pendingUiPrompts.delete(chatId);
+			const yes = data === "uip:confirm:y";
+			void stripKeyboardWithReply(chatId, pending.messageId, yes ? "✅ Yes." : "❌ No.");
+			pending.resolve(yes);
+			return true;
+		}
+		if (pending.kind === "select" && data.startsWith("uip:select:")) {
+			const idx = Number.parseInt(data.slice("uip:select:".length), 10);
+			if (Number.isFinite(idx) && idx >= 0 && idx < pending.options.length) {
+				clearTimeout(pending.timer);
+				pendingUiPrompts.delete(chatId);
+				const choice = pending.options[idx];
+				void stripKeyboardWithReply(chatId, pending.messageId, `Selected: ${choice}`);
+				pending.resolve(choice);
+				return true;
+			}
+		}
+		// Stale or malformed payload — claim it so the generic "Unknown action"
+		// path doesn't fire and confuse the user.
+		return true;
+	}
+
+	function consumePendingInput(chatId: number, text: string): boolean {
+		const pending = pendingUiPrompts.get(chatId);
+		if (!pending || pending.kind !== "input") return false;
+		clearTimeout(pending.timer);
+		pendingUiPrompts.delete(chatId);
+		const trimmed = text.trim();
+		if (trimmed === "/cancel") {
+			void sendTextReply(chatId, pending.messageId, "Input cancelled.").catch(() => {});
+			pending.resolve(undefined);
+		} else {
+			pending.resolve(text);
+		}
+		return true;
+	}
+
+	function pendingPromptKind(chatId: number): PendingUiPrompt["kind"] | undefined {
+		return pendingUiPrompts.get(chatId)?.kind;
+	}
+
 	async function handleAuthorizedTelegramMessage(message: TelegramMessage, ctx: ExtensionContext): Promise<void> {
+		// If an extension is awaiting ui.input for this chat, the next plain-text
+		// message becomes the answer and is NOT dispatched as a new turn. Photos,
+		// docs, etc. fall through to normal dispatch — the prompt keeps waiting.
+		const pendingKind = pendingPromptKind(message.chat.id);
+		if (pendingKind === "input") {
+			const text = message.text ?? message.caption;
+			if (typeof text === "string" && text.length > 0) {
+				if (consumePendingInput(message.chat.id, text)) return;
+			}
+		} else if (pendingKind === "confirm" || pendingKind === "select") {
+			// User typed instead of tapping a button — nudge, then let dispatch run
+			// as normal so they don't lose the message they sent.
+			await sendTextReply(
+				message.chat.id,
+				message.message_id,
+				pendingKind === "confirm"
+					? "(Tip: tap Yes or No on the prompt above.)"
+					: "(Tip: tap an option on the prompt above.)",
+			);
+		}
+
 		if (message.media_group_id) {
 			const key = `${message.chat.id}:${message.media_group_id}`;
 			const existing = mediaGroups.get(key) ?? { messages: [] };
@@ -1757,6 +1993,15 @@ export default function (pi: ExtensionAPI) {
 			if (cq.from && cq.from.id !== config.allowedUserId) return;
 
 			if (cq.data && cq.message) {
+				if (cq.data.startsWith("uip:")) {
+					const handled = await handleUiPromptCallback(
+						cq.id,
+						cq.message.chat.id,
+						cq.message.message_id,
+						cq.data,
+					);
+					if (handled) return;
+				}
 				if (cq.data.startsWith("thinking:")) {
 					const handled = await handleThinkingCallback(
 						cq.id,
@@ -2086,10 +2331,64 @@ export default function (pi: ExtensionAPI) {
 		if (config.botToken && !pollingPromise) { await startPolling(ctx); }
 		updateStatus(ctx);
 		void syncTelegramCommands(ctx);
+		installCtxUiBridge(ctx.ui);
 	});
+
+	// Wraps confirm/select/input/custom on the runner-shared uiContext so every
+	// extension sees the bridged versions without each having to opt in. The
+	// originals run when no Telegram turn is in flight (e.g. /telegram-setup at
+	// the pi TUI). Idempotent — pi can re-fire session_start on /reload, and
+	// the runtime may swap the uiContext underneath us, so we re-check via a
+	// hidden marker on the object.
+	function installCtxUiBridge(ui: ExtensionUIContext): void {
+		const tagged = ui as ExtensionUIContext & { __telegramBridgeInstalled?: boolean };
+		if (tagged.__telegramBridgeInstalled) return;
+
+		const origConfirm = ui.confirm.bind(ui);
+		const origSelect = ui.select.bind(ui);
+		const origInput = ui.input.bind(ui);
+		const origCustom = ui.custom.bind(ui);
+
+		const wrappedConfirm: ExtensionUIContext["confirm"] = async (title, message, opts) => {
+			const chatId = getActiveTelegramChatId();
+			if (chatId !== undefined) return uiConfirmViaTelegram(chatId, title, message);
+			return origConfirm(title, message, opts);
+		};
+		const wrappedSelect: ExtensionUIContext["select"] = async (title, options, opts) => {
+			const chatId = getActiveTelegramChatId();
+			if (chatId !== undefined) return uiSelectViaTelegram(chatId, title, options);
+			return origSelect(title, options, opts);
+		};
+		const wrappedInput: ExtensionUIContext["input"] = async (title, placeholder, opts) => {
+			const chatId = getActiveTelegramChatId();
+			if (chatId !== undefined) return uiInputViaTelegram(chatId, title, placeholder);
+			return origInput(title, placeholder, opts);
+		};
+		const wrappedCustom: ExtensionUIContext["custom"] = async (factory, options) => {
+			const chatId = getActiveTelegramChatId();
+			if (chatId !== undefined) {
+				await sendTextReply(
+					chatId,
+					activeTelegramTurn?.replyToMessageId ?? 0,
+					"An extension tried to open a TUI overlay, which Telegram can't render. Resolving as cancelled.",
+				);
+				// `Promise<never>` is assignable to `Promise<T>`; calling code that
+				// treats undefined as cancelled handles this gracefully.
+				return undefined as never;
+			}
+			return origCustom(factory, options);
+		};
+
+		ui.confirm = wrappedConfirm;
+		ui.select = wrappedSelect;
+		ui.input = wrappedInput;
+		ui.custom = wrappedCustom;
+		tagged.__telegramBridgeInstalled = true;
+	}
 
 	pi.on("session_shutdown", async (_event, _ctx) => {
 		queuedTelegramTurns = [];
+		cancelAllPendingUiPrompts("Cancelled — pi session ended.");
 		for (const state of mediaGroups.values()) {
 			if (state.flushTimer) clearTimeout(state.flushTimer);
 		}
