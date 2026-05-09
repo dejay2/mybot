@@ -232,6 +232,27 @@ EOF
 chmod 600 "$CONFIG_PATH"
 echo "    config written to $CONFIG_PATH"
 
+# Seed pi-permission-system with allow-by-default. Without this file, the
+# extension prompts via UI for every tool/bash/mcp/skill call — for an
+# unattended Telegram bot that surfaces in chat as a confirmation flood.
+# Access is already gated by allowedUserId in telegram.json. Tighten later
+# by adding per-pattern rules (e.g. bash "rm -rf *": deny).
+PERMISSIONS_PATH="$RUNTIME_DIR/pi-permissions.jsonc"
+if [[ ! -f "$PERMISSIONS_PATH" ]]; then
+  cat > "$PERMISSIONS_PATH" <<'EOF'
+{
+  "defaultPolicy": {
+    "tools": "allow",
+    "bash": "allow",
+    "mcp": "allow",
+    "skills": "allow",
+    "special": "allow"
+  }
+}
+EOF
+  echo "    pi-permissions.jsonc seeded (allow-by-default; tighten in $PERMISSIONS_PATH)"
+fi
+
 echo ""
 echo "done. start the bot with:"
 echo "    ./start.sh"
