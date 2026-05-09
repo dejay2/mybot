@@ -46,6 +46,45 @@ CANONICAL=(
   "npm:pi-permission-system"
 )
 
+# Pre-flight: warn about project-local extensions in .pi/extensions/ whose
+# names match canonical npm packages we're about to add. Pi auto-discovers
+# .pi/extensions/<name>/ and .pi/extensions/<name>.ts, and loading both copies
+# registers the same tools twice — pi then crash-loops on every session_start.
+# The match is heuristic (by name only), but catches the common shadow-install
+# pattern, e.g. .pi/extensions/pi-web-access/ alongside npm:pi-web-access.
+EXT_DIR="$REPO_ROOT/.pi/extensions"
+SHADOWS=()
+for pkg in "${CANONICAL[@]}"; do
+  spec="${pkg#npm:}"
+  case "$spec" in
+    @*/*) name="${spec#@*/}"; name="${name%@*}" ;;
+    *)    name="${spec%@*}" ;;
+  esac
+  if [[ -d "$EXT_DIR/$name" ]]; then
+    SHADOWS+=("$name (dir): $EXT_DIR/$name")
+  elif [[ -f "$EXT_DIR/$name.ts" ]]; then
+    SHADOWS+=("$name (file): $EXT_DIR/$name.ts")
+  fi
+done
+
+if [[ ${#SHADOWS[@]} -gt 0 ]]; then
+  {
+    echo "[sync-extensions] error: shadow install(s) would clash with canonical npm packages:"
+    for s in "${SHADOWS[@]}"; do
+      echo "    $s"
+    done
+    echo ""
+    echo "Pi auto-discovers .pi/extensions/<name>/ and .pi/extensions/<name>.ts."
+    echo "Adding the matching npm:<name> entry would load both copies and crash pi."
+    echo ""
+    echo "Resolve by moving each shadow out of .pi/extensions/, e.g.:"
+    echo "    mv .pi/extensions/<name> .pi/<name>.local-backup-\$(date +%Y%m%d)"
+    echo ""
+    echo "Then re-run this script."
+  } >&2
+  exit 2
+fi
+
 node - "$SETTINGS_PATH" "${CANONICAL[@]}" <<'NODE'
 const fs = require("node:fs");
 const [path, ...canonical] = process.argv.slice(2);
