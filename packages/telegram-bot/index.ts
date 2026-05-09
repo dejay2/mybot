@@ -1970,26 +1970,6 @@ export default function (pi: ExtensionAPI) {
 	// next update.
 	const pendingAgentTaskInputs = new Map<number, PendingAgentTaskInput>();
 
-	// FIFO queue of /run dispatches awaiting their `subagent-slash-result`
-	// message_end so we can route the rendered output back to the originating
-	// chat. pi-subagents emits the result as a custom message into the pi
-	// session — perfect for the TUI, invisible to Telegram unless we forward
-	// it. We match by agent name in dispatch order; concurrent /runs of the
-	// same agent from different chats would collide, but that's a corner case
-	// we accept until pi-subagents exposes a request id at dispatch time.
-	interface PendingSubagentDispatch {
-		chatId: number;
-		replyToId: number;
-		agent: string;
-		dispatchedAt: number;
-		// Per-dispatch typing interval. Telegram's typing indicator lasts ~5s,
-		// so we re-send every 4s until the result arrives (or 5min, whichever
-		// first). Tracked per-dispatch rather than via the global typingLoop so
-		// concurrent regular turns aren't disrupted.
-		typingTimer: ReturnType<typeof setInterval>;
-	}
-	const pendingSubagentDispatches: PendingSubagentDispatch[] = [];
-
 	function startSubagentTyping(chatId: number): ReturnType<typeof setInterval> {
 		const sendTyping = (): void => {
 			void callTelegram("sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
@@ -1997,9 +1977,84 @@ export default function (pi: ExtensionAPI) {
 		sendTyping();
 		const timer = setInterval(sendTyping, 4000);
 		// Auto-clear after 5 minutes so we never leak a forever-typing indicator
-		// if the subagent crashes without posting a terminal slash-result.
+		// if the subagent crashes without posting anything.
 		setTimeout(() => clearInterval(timer), 5 * 60 * 1000);
 		return timer;
+	}
+
+	// Find the most-recently-written subagent-artifact meta.json for an agent
+	// after a given dispatch time. Returns the parsed meta + output text from
+	// the sibling _output.md.
+	//
+	// Using the artifact files (rather than pi.on("message_end")) is the only
+	// reliable way: pi-subagents publishes the slash-result via
+	// `pi.sendMessage(...)`, which goes through agent-session._emit (listeners
+	// only) and skips _emitExtensionEvent — so no extension event fires.
+	async function readLatestSubagentArtifact(
+		agent: string,
+		minMtimeMs: number,
+	): Promise<{ runId: string; meta: Record<string, unknown>; output: string } | undefined> {
+		const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+		const sessionsDir = join(agentDir, "sessions");
+		let sessionSubdirs: string[];
+		try {
+			sessionSubdirs = await readdir(sessionsDir);
+		} catch {
+			return undefined;
+		}
+
+		const filenameRe = /^([a-f0-9]+)_(.+?)_\d+_meta\.json$/;
+		let best: { path: string; mtimeMs: number; runId: string } | undefined;
+		for (const subdir of sessionSubdirs) {
+			const artifactsDir = join(sessionsDir, subdir, "subagent-artifacts");
+			let entries: string[];
+			try {
+				entries = await readdir(artifactsDir);
+			} catch {
+				continue;
+			}
+			for (const entry of entries) {
+				const m = entry.match(filenameRe);
+				if (!m) continue;
+				if (m[2] !== agent) continue;
+				const filePath = join(artifactsDir, entry);
+				try {
+					const s = await stat(filePath);
+					if (s.mtimeMs < minMtimeMs - 1000) continue;
+					if (!best || s.mtimeMs > best.mtimeMs) {
+						best = { path: filePath, mtimeMs: s.mtimeMs, runId: m[1] };
+					}
+				} catch {
+					continue;
+				}
+			}
+		}
+		if (!best) return undefined;
+
+		try {
+			const meta = JSON.parse(await readFile(best.path, "utf8")) as Record<string, unknown>;
+			let output = "";
+			try {
+				output = await readFile(best.path.replace(/_meta\.json$/, "_output.md"), "utf8");
+			} catch {
+				// Output file may be empty/missing on early failures — header still useful.
+			}
+			return { runId: best.runId, meta, output };
+		} catch {
+			return undefined;
+		}
+	}
+
+	function formatSubagentResultText(agent: string, result: { meta: Record<string, unknown>; output: string }): string {
+		const meta = result.meta as { exitCode?: number; error?: string; durationMs?: number };
+		const header = meta.exitCode === 0 ? `✅ /run ${agent}` : `❌ /run ${agent} (exit ${meta.exitCode ?? "?"})`;
+		const trimmedOutput = result.output.trim();
+		const body = meta.error ? meta.error : (trimmedOutput || "(no output)");
+		// Telegram caps message text at 4096 chars; truncate generously to leave
+		// room for the header and a "[truncated]" hint.
+		const MAX = 3800;
+		if (body.length <= MAX) return `${header}\n\n${body}`;
+		return `${header}\n\n${body.slice(0, MAX)}\n\n[…truncated, ${body.length - MAX} more chars]`;
 	}
 
 	function buildAgentRunKeyboard(agent: string, taskHint: string): {
@@ -2171,74 +2226,39 @@ export default function (pi: ExtensionAPI) {
 		if (fork) argsParts.push("--fork");
 		const args = argsParts.join(" ");
 
+		const exec = (pi as { executeCommand?: (name: string, args?: string) => Promise<boolean> }).executeCommand;
+		if (typeof exec !== "function") {
+			await sendTextReply(chatId, originalReplyToId, "/run: this pi build doesn't support remote command dispatch.");
+			return;
+		}
+
+		const dispatchedAt = Date.now();
+		const typingTimer = startSubagentTyping(chatId);
+		pendingTelegramCommandReply = { chatId, messageId: originalReplyToId, suppressAck: false };
 		try {
-			const exec = (pi as { executeCommand?: (name: string, args?: string) => Promise<boolean> }).executeCommand;
-			if (typeof exec !== "function") {
-				await sendTextReply(chatId, originalReplyToId, "/run: this pi build doesn't support remote command dispatch.");
+			const handled = await exec("run", args);
+			if (!handled) {
+				await sendTextReply(chatId, originalReplyToId, "/run is not registered (is pi-subagents installed?).");
 				return;
 			}
-			// Record before exec so the message_end listener can match — the
-			// subagent posts message_start within ms of dispatch.
-			const typingTimer = startSubagentTyping(chatId);
-			pendingSubagentDispatches.push({ chatId, replyToId: originalReplyToId, agent, dispatchedAt: Date.now(), typingTimer });
-			pendingTelegramCommandReply = { chatId, messageId: originalReplyToId, suppressAck: false };
-			try {
-				const handled = await exec("run", args);
-				if (!handled) {
-					// Drop the entry we just queued — no result will arrive.
-					const idx = pendingSubagentDispatches.findIndex((d) => d.chatId === chatId && d.agent === agent);
-					if (idx !== -1) {
-						clearInterval(pendingSubagentDispatches[idx].typingTimer);
-						pendingSubagentDispatches.splice(idx, 1);
-					}
-					await sendTextReply(chatId, originalReplyToId, "/run is not registered (is pi-subagents installed?).");
-				}
-				// On success, forwardSubagentSlashResult sends the result when the
-				// message_end event fires — no extra ack here.
-			} finally {
-				pendingTelegramCommandReply = undefined;
+			// pi-subagents publishes the slash-result via pi.sendMessage, which
+			// does NOT trigger pi.on(...) extension handlers (it goes through
+			// _emit, not _emitExtensionEvent). So we read the artifact files
+			// the subagent wrote — they're flushed before runSlashSubagent
+			// resolves, which is what `await exec(...)` waits on.
+			const result = await readLatestSubagentArtifact(agent, dispatchedAt);
+			if (!result) {
+				await sendTextReply(chatId, originalReplyToId, `✅ /run ${agent} dispatched, but no result artifact was found.`);
+				return;
 			}
+			await sendTextReply(chatId, originalReplyToId, formatSubagentResultText(agent, result));
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			await sendTextReply(chatId, originalReplyToId, `/run ${agent} failed: ${message}`);
+		} finally {
+			clearInterval(typingTimer);
+			pendingTelegramCommandReply = undefined;
 		}
-	}
-
-	// pi-subagents posts the rendered result as a `subagent-slash-result`
-	// custom message twice: first with status "running" (just the task echoed
-	// back) at message_start, then again at message_end with the full output.
-	// We forward the second one. Returns the chat info to send to, plus the
-	// formatted text — null if this isn't ours or the message is the in-flight
-	// "running" placeholder.
-	function takeSubagentResultPayload(message: AgentMessage): {
-		chatId: number;
-		replyToId: number;
-		text: string;
-	} | null {
-		if (message.role !== "custom") return null;
-		const cm = message as { customType?: string; content?: unknown; details?: unknown };
-		if (cm.customType !== "subagent-slash-result") return null;
-
-		const details = cm.details as
-			| { result?: { details?: { results?: Array<{ agent?: string; exitCode?: number; finalOutput?: string; error?: string; outputReference?: { message?: string } }> } } }
-			| undefined;
-		const first = details?.result?.details?.results?.[0];
-		if (!first) return null;
-		// The "running" placeholder lacks exitCode / finalOutput. Only forward
-		// the terminal one.
-		if (first.exitCode === undefined && !first.error) return null;
-
-		const agent = first.agent ?? "";
-		const idx = pendingSubagentDispatches.findIndex((d) => d.agent === agent);
-		if (idx === -1) return null;
-		const [pending] = pendingSubagentDispatches.splice(idx, 1);
-		clearInterval(pending.typingTimer);
-
-		const header = first.exitCode === 0 ? `✅ /run ${agent}` : `❌ /run ${agent} (exit ${first.exitCode ?? "?"})`;
-		const body = first.error
-			? first.error
-			: (first.finalOutput?.trim() || first.outputReference?.message || "(no output)");
-		return { chatId: pending.chatId, replyToId: pending.replyToId, text: `${header}\n\n${body}` };
 	}
 
 	// ========================================================================
@@ -2896,8 +2916,6 @@ export default function (pi: ExtensionAPI) {
 			void sendTextReply(chatId, pending.promptMessageId, "Cancelled — pi session ended.");
 		}
 		pendingAgentTaskInputs.clear();
-		for (const d of pendingSubagentDispatches) clearInterval(d.typingTimer);
-		pendingSubagentDispatches.length = 0;
 		for (const state of mediaGroups.values()) {
 			if (state.flushTimer) clearTimeout(state.flushTimer);
 		}
@@ -2951,12 +2969,6 @@ export default function (pi: ExtensionAPI) {
 		}
 		previewState.pendingText = getMessageText(event.message);
 		schedulePreviewFlush(activeTelegramTurn.chatId);
-	});
-
-	pi.on("message_end", async (event, _ctx) => {
-		const payload = takeSubagentResultPayload(event.message);
-		if (!payload) return;
-		await sendTextReply(payload.chatId, payload.replyToId, payload.text);
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
