@@ -13,7 +13,8 @@
 #   PI_MEMORY_DIR        -> runtime/agent/memory   (MEMORY.md, scratchpad, daily logs)
 #   QMD_CONFIG_DIR       -> runtime/qmd-config     (qmd collection registry)
 #   XDG_CACHE_HOME       -> runtime/cache          (qmd index.sqlite + GGUF models, bun cache)
-#   PATH (prefix)        -> runtime/bun/bin        (bundled bun + qmd)
+#   PATH (prefix)        -> runtime/bin            (pi alias for pi-subagents)
+#                        -> runtime/bun/bin        (bundled bun + qmd)
 #
 # The binary name is whatever was chosen at ./setup.sh time and stored in
 # runtime/agent/.bot-name (defaults to "pi"). Invoked via runtime/bin/<NAME>
@@ -48,7 +49,7 @@ export PI_TELEGRAM_CONFIG="$REPO_ROOT/runtime/agent/telegram.json"
 export PI_MEMORY_DIR="$REPO_ROOT/runtime/agent/memory"
 export QMD_CONFIG_DIR="$REPO_ROOT/runtime/qmd-config"
 export XDG_CACHE_HOME="$REPO_ROOT/runtime/cache"
-export PATH="$REPO_ROOT/runtime/bun/bin:$PATH"
+export PATH="$REPO_ROOT/runtime/bin:$REPO_ROOT/runtime/bun/bin:$PATH"
 
 # Build the actual command we'll run. Gateway is the default; --no-gateway
 # falls back to the bare pi binary for debugging / parity with old behavior.

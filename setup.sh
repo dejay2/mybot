@@ -129,6 +129,16 @@ BIN_LINK="$REPO_ROOT/runtime/bin/$BOT_NAME"
 ln -sfn "../../packages/coding-agent/dist/pi" "$BIN_LINK"
 echo "    binary:    $BIN_LINK -> packages/coding-agent/dist/pi"
 
+# Also symlink as `pi` so pi-subagents can spawn subagent runs via the
+# canonical name (it resolves through PATH, see start.sh). Without this,
+# `/run` from Telegram fails with "Executable not found in $PATH: pi" on
+# any install where the binary was renamed (mandy/chilito/etc).
+PI_LINK="$REPO_ROOT/runtime/bin/pi"
+if [[ "$BOT_NAME" != "pi" ]]; then
+  ln -sfn "../../packages/coding-agent/dist/pi" "$PI_LINK"
+  echo "    pi alias:  $PI_LINK -> packages/coding-agent/dist/pi (for pi-subagents)"
+fi
+
 # Persist the chosen name so start.sh picks it up without re-asking.
 echo "$BOT_NAME" > "$RUNTIME_DIR/.bot-name"
 
