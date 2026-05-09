@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -664,11 +664,151 @@ export default function (pi: ExtensionAPI) {
 
 	let lastSyncedCommandsHash: string | undefined;
 	let activeReverseMap: Map<string, string> = new Map();
+	// `/run_<sanitized>` -> original agent name. Populated alongside
+	// activeReverseMap by syncTelegramCommands so the dispatcher can recognise
+	// agent commands and route them to the flag picker instead of pi.executeCommand.
+	let activeAgentCommandMap: Map<string, string> = new Map();
 
 	function sanitizeTelegramCommandName(raw: string): string | undefined {
 		const lowered = raw.toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "");
 		if (!lowered) return undefined;
 		return lowered.slice(0, 32);
+	}
+
+	// Agents discovered from pi-subagents' canonical directory layout.
+	// Mirrors discoverAgents() in @mariozechner/pi-subagents — duplicated rather
+	// than imported because the package isn't a peer dep and resolves to a
+	// global npm install we can't see from this workspace.
+	interface DiscoveredAgent {
+		name: string;
+		description: string;
+		source: "builtin" | "user" | "project";
+	}
+
+	function parseAgentFrontmatter(content: string): { name?: string; description?: string; disabled?: boolean } {
+		// Accept `---\n` and `---\r\n` separators.
+		const head = content.startsWith("---\r\n") ? 5 : content.startsWith("---\n") ? 4 : -1;
+		if (head === -1) return {};
+		const rest = content.slice(head);
+		const closeMatch = rest.match(/(^|\n)---(\r?\n|$)/);
+		if (!closeMatch || closeMatch.index === undefined) return {};
+		const block = rest.slice(0, closeMatch.index);
+		const out: { name?: string; description?: string; disabled?: boolean } = {};
+		for (const rawLine of block.split(/\r?\n/)) {
+			const line = rawLine.trimEnd();
+			if (!line || line.startsWith("#")) continue;
+			const colon = line.indexOf(":");
+			if (colon === -1) continue;
+			const key = line.slice(0, colon).trim();
+			let value = line.slice(colon + 1).trim();
+			if (value.length >= 2) {
+				const first = value[0];
+				const last = value[value.length - 1];
+				if ((first === "\"" && last === "\"") || (first === "'" && last === "'")) {
+					value = value.slice(1, -1);
+				}
+			}
+			if (key === "name") out.name = value;
+			else if (key === "description") out.description = value;
+			else if (key === "disabled" && (value === "true" || value === "false")) out.disabled = value === "true";
+		}
+		return out;
+	}
+
+	async function readAgentsFromDir(dir: string, source: DiscoveredAgent["source"]): Promise<DiscoveredAgent[]> {
+		let entries: string[];
+		try {
+			entries = await readdir(dir);
+		} catch {
+			return [];
+		}
+		const out: DiscoveredAgent[] = [];
+		for (const entry of entries) {
+			if (!entry.endsWith(".md")) continue;
+			let content: string;
+			try {
+				content = await readFile(join(dir, entry), "utf8");
+			} catch {
+				continue;
+			}
+			const meta = parseAgentFrontmatter(content);
+			if (meta.disabled === true) continue;
+			const name = meta.name || basename(entry, ".md");
+			out.push({ name, description: meta.description ?? "", source });
+		}
+		return out;
+	}
+
+	async function findNearestProjectRoot(cwd: string): Promise<string | null> {
+		let dir = cwd;
+		while (true) {
+			for (const marker of [".pi", ".agents"]) {
+				try {
+					const s = await stat(join(dir, marker));
+					if (s.isDirectory()) return dir;
+				} catch {
+					// not present — try next marker
+				}
+			}
+			const parent = dirname(dir);
+			if (parent === dir) return null;
+			dir = parent;
+		}
+	}
+
+	// Cached at startup. pi installs npm extensions to the npm-global root, but
+	// the exact path varies (~/.npm-global/lib/node_modules, /usr/lib/..., etc).
+	// We resolve once via `npm root -g` so prod systemd installs (which run as
+	// root and may use a different prefix) find pi-subagents/agents reliably.
+	let cachedNpmGlobalRoot: string | undefined | null;
+	async function getNpmGlobalRoot(): Promise<string | undefined> {
+		if (cachedNpmGlobalRoot !== undefined) return cachedNpmGlobalRoot ?? undefined;
+		try {
+			const result = await pi.exec("npm", ["root", "-g"], { timeout: 5000 });
+			const out = (result.stdout ?? "").trim();
+			cachedNpmGlobalRoot = out || null;
+			return cachedNpmGlobalRoot ?? undefined;
+		} catch {
+			cachedNpmGlobalRoot = null;
+			return undefined;
+		}
+	}
+
+	async function discoverAgents(cwd: string): Promise<DiscoveredAgent[]> {
+		const home = homedir();
+		const projectRoot = await findNearestProjectRoot(cwd);
+
+		// Order encodes precedence: later entries override earlier ones (so
+		// project agents shadow user, user shadow builtin).
+		const dirs: Array<{ path: string; source: DiscoveredAgent["source"] }> = [];
+
+		const npmGlobalRoot = await getNpmGlobalRoot();
+		const builtinCandidates = [
+			npmGlobalRoot ? join(npmGlobalRoot, "pi-subagents", "agents") : undefined,
+			join(home, ".npm-global", "lib", "node_modules", "pi-subagents", "agents"),
+			"/usr/local/lib/node_modules/pi-subagents/agents",
+			"/usr/lib/node_modules/pi-subagents/agents",
+		].filter((p): p is string => typeof p === "string");
+		for (const candidate of builtinCandidates) {
+			dirs.push({ path: candidate, source: "builtin" });
+		}
+
+		dirs.push({ path: join(home, ".pi", "agent", "agents"), source: "user" });
+		dirs.push({ path: join(home, ".agents"), source: "user" });
+
+		if (projectRoot) {
+			dirs.push({ path: join(projectRoot, ".agents"), source: "project" });
+			dirs.push({ path: join(projectRoot, ".pi", "agents"), source: "project" });
+		}
+
+		const dedup = new Map<string, DiscoveredAgent>();
+		for (const { path, source } of dirs) {
+			for (const agent of await readAgentsFromDir(path, source)) {
+				dedup.set(agent.name, agent);
+			}
+		}
+
+		return Array.from(dedup.values()).sort((a, b) => a.name.localeCompare(b.name));
 	}
 
 	// pi's built-in slash commands are NOT returned by pi.getCommands() — that
@@ -699,10 +839,15 @@ export default function (pi: ExtensionAPI) {
 		{ name: "quit", description: "Quit pi" },
 	];
 
-	function buildTelegramCommandList(): { payload: Array<{ command: string; description: string }>; reverseMap: Map<string, string> } {
+	function buildTelegramCommandList(agents: DiscoveredAgent[]): {
+		payload: Array<{ command: string; description: string }>;
+		reverseMap: Map<string, string>;
+		agentCommandMap: Map<string, string>;
+	} {
 		const seen = new Set<string>();
 		const payload: Array<{ command: string; description: string }> = [];
 		const reverseMap = new Map<string, string>();
+		const agentCommandMap = new Map<string, string>();
 
 		const addEntry = (originalName: string, description: string): void => {
 			const tgName = sanitizeTelegramCommandName(originalName);
@@ -733,13 +878,34 @@ export default function (pi: ExtensionAPI) {
 			addEntry(cmd.name, cmd.description ?? "pi command");
 		}
 
-		return { payload, reverseMap };
+		// Subagent shortcuts: `/run_<agent>` so Telegram's slash autocomplete
+		// surfaces every agent as the user types `/run`. The dispatcher routes
+		// these to the flag picker rather than pi.executeCommand.
+		const sourceLabel: Record<DiscoveredAgent["source"], string> = {
+			builtin: "builtin",
+			user: "user",
+			project: "project",
+		};
+		for (const agent of agents) {
+			if (payload.length >= 100) break;
+			const tgName = sanitizeTelegramCommandName(`run_${agent.name}`);
+			if (!tgName || seen.has(tgName)) continue;
+			const baseDesc = agent.description ? `: ${agent.description}` : "";
+			const desc = `Run ${agent.name} (${sourceLabel[agent.source]})${baseDesc}`.slice(0, 256);
+			payload.push({ command: tgName, description: desc });
+			seen.add(tgName);
+			agentCommandMap.set(tgName, agent.name);
+		}
+
+		return { payload, reverseMap, agentCommandMap };
 	}
 
 	async function syncTelegramCommands(ctx: ExtensionContext): Promise<void> {
 		if (!config.botToken) return;
-		const { payload, reverseMap } = buildTelegramCommandList();
+		const agents = await discoverAgents(process.cwd());
+		const { payload, reverseMap, agentCommandMap } = buildTelegramCommandList(agents);
 		activeReverseMap = reverseMap;
+		activeAgentCommandMap = agentCommandMap;
 		const hash = JSON.stringify(payload);
 		if (hash === lastSyncedCommandsHash) return;
 		try {
@@ -1369,6 +1535,22 @@ export default function (pi: ExtensionAPI) {
 
 		if (lower.startsWith("/")) {
 			const tgName = lower.slice(1).split(/[\s@]/)[0];
+
+			// `/run_<agent>` shortcut — show the flag picker, then dispatch
+			// `/run <agent> <task> [--bg] [--fork]` once the user selects a mode.
+			const agentName = activeAgentCommandMap.get(tgName);
+			if (agentName) {
+				const argSpace = rawText.indexOf(" ");
+				const taskHint = argSpace === -1 ? "" : rawText.slice(argSpace + 1).trim();
+				await renderAgentRunPicker(
+					firstMessage.chat.id,
+					firstMessage.message_id,
+					agentName,
+					taskHint,
+				);
+				return;
+			}
+
 			const piName = activeReverseMap.get(tgName);
 			if (piName) {
 				// Commands that need an interactive TUI selector or dialog can't run
@@ -1759,6 +1941,174 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// ========================================================================
+	// /run_<agent> flow: Telegram-only flag picker that turns the synthetic
+	// `/run_<agent>` command into the equivalent of `/run <agent> <task> [--bg]
+	// [--fork]` against pi-subagents. Task can be supplied inline after the
+	// command; if missing, we ask via the bridged ctx.ui.input prompt.
+	// ========================================================================
+
+	interface PendingAgentRun {
+		agent: string;
+		taskHint: string;
+		keyboardMessageId: number;
+		originalReplyToId: number;
+	}
+	// chatId -> pending agent run awaiting a flag selection
+	const pendingAgentRuns = new Map<number, PendingAgentRun>();
+
+	function buildAgentRunKeyboard(agent: string, taskHint: string): {
+		text: string;
+		keyboard: Array<Array<{ text: string; callback_data: string }>>;
+	} {
+		const headerLines = [`Run ${agent}`];
+		if (taskHint) {
+			const preview = taskHint.length > 200 ? `${taskHint.slice(0, 197)}…` : taskHint;
+			headerLines.push(`Task: ${preview}`);
+		} else {
+			headerLines.push("Task: (will be asked next)");
+		}
+		headerLines.push("", "Pick execution mode:");
+		const keyboard: Array<Array<{ text: string; callback_data: string }>> = [
+			[{ text: "▶️ Run", callback_data: "agentrun:plain" }],
+			[{ text: "🔁 Run --bg (background)", callback_data: "agentrun:bg" }],
+			[{ text: "🔀 Run --fork (forked context)", callback_data: "agentrun:fork" }],
+			[{ text: "🔁🔀 Run --bg --fork", callback_data: "agentrun:bgfork" }],
+			[{ text: "❌ Cancel", callback_data: "agentrun:cancel" }],
+		];
+		return { text: headerLines.join("\n"), keyboard };
+	}
+
+	async function renderAgentRunPicker(
+		chatId: number,
+		originalReplyToId: number,
+		agent: string,
+		taskHint: string,
+	): Promise<void> {
+		// Replace any prior picker for this chat — only one outstanding flag
+		// selection at a time. Stale keyboards become harmless once the state
+		// they referenced is gone.
+		const prev = pendingAgentRuns.get(chatId);
+		if (prev) {
+			pendingAgentRuns.delete(chatId);
+			void stripKeyboardWithReply(chatId, prev.keyboardMessageId, "Cancelled — superseded by a new /run picker.");
+		}
+
+		const { text, keyboard } = buildAgentRunKeyboard(agent, taskHint);
+		try {
+			const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
+				chat_id: chatId,
+				text,
+				reply_markup: { inline_keyboard: keyboard },
+			});
+			pendingAgentRuns.set(chatId, {
+				agent,
+				taskHint,
+				keyboardMessageId: sent.message_id,
+				originalReplyToId,
+			});
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			await sendTextReply(chatId, originalReplyToId, `Failed to show /run picker: ${message}`);
+		}
+	}
+
+	async function handleAgentRunCallback(
+		callbackQueryId: string,
+		chatId: number,
+		keyboardMessageId: number,
+		data: string,
+	): Promise<boolean> {
+		if (!data.startsWith("agentrun:")) return false;
+		try {
+			await callTelegram<TelegramCallbackAnswer>("answerCallbackQuery", { callback_query_id: callbackQueryId });
+		} catch {
+			// ignore
+		}
+
+		const pending = pendingAgentRuns.get(chatId);
+		if (!pending || pending.keyboardMessageId !== keyboardMessageId) {
+			// Stale or wrong picker — claim the callback so the generic "Unknown
+			// action" fallback doesn't fire.
+			void stripKeyboardWithReply(chatId, keyboardMessageId, "Picker no longer active.");
+			return true;
+		}
+
+		const choice = data.slice("agentrun:".length);
+		if (choice === "cancel") {
+			pendingAgentRuns.delete(chatId);
+			void stripKeyboardWithReply(chatId, keyboardMessageId, `❌ /run ${pending.agent} cancelled.`);
+			return true;
+		}
+
+		let bg = false;
+		let fork = false;
+		switch (choice) {
+			case "plain": break;
+			case "bg": bg = true; break;
+			case "fork": fork = true; break;
+			case "bgfork": bg = true; fork = true; break;
+			default: return true;
+		}
+
+		pendingAgentRuns.delete(chatId);
+		const flagsLabel = [bg ? "--bg" : null, fork ? "--fork" : null].filter(Boolean).join(" ") || "no flags";
+		void stripKeyboardWithReply(chatId, keyboardMessageId, `▶️ Running ${pending.agent} (${flagsLabel})…`);
+
+		// Ask for the task if it wasn't supplied inline. Reuses the existing
+		// ui-prompt input plumbing — `consumePendingInput` will pick up the next
+		// plain-text message in this chat as the answer.
+		let task = pending.taskHint;
+		if (!task) {
+			const answer = await uiInputViaTelegram(
+				chatId,
+				`Task for ${pending.agent}:`,
+				"what should the agent do?",
+			);
+			if (answer === undefined) {
+				await sendTextReply(chatId, pending.originalReplyToId, `Cancelled — no task supplied for ${pending.agent}.`);
+				return true;
+			}
+			task = answer.trim();
+		}
+
+		const argsParts = [pending.agent];
+		if (task) argsParts.push(task);
+		if (bg) argsParts.push("--bg");
+		if (fork) argsParts.push("--fork");
+		const args = argsParts.join(" ");
+
+		try {
+			const exec = (pi as { executeCommand?: (name: string, args?: string) => Promise<boolean> }).executeCommand;
+			if (typeof exec !== "function") {
+				await sendTextReply(chatId, pending.originalReplyToId, "/run: this pi build doesn't support remote command dispatch.");
+				return true;
+			}
+			pendingTelegramCommandReply = {
+				chatId,
+				messageId: pending.originalReplyToId,
+				suppressAck: false,
+			};
+			try {
+				const handled = await exec("run", args);
+				const suppressAck = pendingTelegramCommandReply?.suppressAck ?? false;
+				if (!handled) {
+					await sendTextReply(chatId, pending.originalReplyToId, "/run is not registered (is pi-subagents installed?).");
+				} else if (!suppressAck) {
+					// pi-subagents reports its own progress via the slash-result entry,
+					// which the Telegram bridge surfaces through normal message flow.
+					// No extra ack needed.
+				}
+			} finally {
+				pendingTelegramCommandReply = undefined;
+			}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			await sendTextReply(chatId, pending.originalReplyToId, `/run ${pending.agent} failed: ${message}`);
+		}
+		return true;
+	}
+
+	// ========================================================================
 	// ctx.ui bridge: route confirm/select/input/custom calls through Telegram
 	// when an extension prompts during a Telegram-driven turn. Falls through to
 	// the original UI when no Telegram turn is active (e.g. /telegram-setup
@@ -2004,6 +2354,15 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (cq.data.startsWith("thinking:")) {
 					const handled = await handleThinkingCallback(
+						cq.id,
+						cq.message.chat.id,
+						cq.message.message_id,
+						cq.data,
+					);
+					if (handled) return;
+				}
+				if (cq.data.startsWith("agentrun:")) {
+					const handled = await handleAgentRunCallback(
 						cq.id,
 						cq.message.chat.id,
 						cq.message.message_id,
@@ -2389,6 +2748,10 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (_event, _ctx) => {
 		queuedTelegramTurns = [];
 		cancelAllPendingUiPrompts("Cancelled — pi session ended.");
+		for (const [chatId, pending] of Array.from(pendingAgentRuns.entries())) {
+			void stripKeyboardWithReply(chatId, pending.keyboardMessageId, "Cancelled — pi session ended.");
+		}
+		pendingAgentRuns.clear();
 		for (const state of mediaGroups.values()) {
 			if (state.flushTimer) clearTimeout(state.flushTimer);
 		}
