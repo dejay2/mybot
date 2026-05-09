@@ -1970,6 +1970,21 @@ export default function (pi: ExtensionAPI) {
 	// next update.
 	const pendingAgentTaskInputs = new Map<number, PendingAgentTaskInput>();
 
+	// FIFO queue of /run dispatches awaiting their `subagent-slash-result`
+	// message_end so we can route the rendered output back to the originating
+	// chat. pi-subagents emits the result as a custom message into the pi
+	// session — perfect for the TUI, invisible to Telegram unless we forward
+	// it. We match by agent name in dispatch order; concurrent /runs of the
+	// same agent from different chats would collide, but that's a corner case
+	// we accept until pi-subagents exposes a request id at dispatch time.
+	interface PendingSubagentDispatch {
+		chatId: number;
+		replyToId: number;
+		agent: string;
+		dispatchedAt: number;
+	}
+	const pendingSubagentDispatches: PendingSubagentDispatch[] = [];
+
 	function buildAgentRunKeyboard(agent: string, taskHint: string): {
 		text: string;
 		keyboard: Array<Array<{ text: string; callback_data: string }>>;
@@ -2145,14 +2160,20 @@ export default function (pi: ExtensionAPI) {
 				await sendTextReply(chatId, originalReplyToId, "/run: this pi build doesn't support remote command dispatch.");
 				return;
 			}
+			// Record before exec so the message_end listener can match — the
+			// subagent posts message_start within ms of dispatch.
+			pendingSubagentDispatches.push({ chatId, replyToId: originalReplyToId, agent, dispatchedAt: Date.now() });
 			pendingTelegramCommandReply = { chatId, messageId: originalReplyToId, suppressAck: false };
 			try {
 				const handled = await exec("run", args);
 				if (!handled) {
+					// Drop the entry we just queued — no result will arrive.
+					const idx = pendingSubagentDispatches.findIndex((d) => d.chatId === chatId && d.agent === agent);
+					if (idx !== -1) pendingSubagentDispatches.splice(idx, 1);
 					await sendTextReply(chatId, originalReplyToId, "/run is not registered (is pi-subagents installed?).");
 				}
-				// pi-subagents emits its own progress via the slash-result entry,
-				// surfaced through the normal Telegram message flow — no extra ack.
+				// On success, forwardSubagentSlashResult sends the result when the
+				// message_end event fires — no extra ack here.
 			} finally {
 				pendingTelegramCommandReply = undefined;
 			}
@@ -2160,6 +2181,42 @@ export default function (pi: ExtensionAPI) {
 			const message = error instanceof Error ? error.message : String(error);
 			await sendTextReply(chatId, originalReplyToId, `/run ${agent} failed: ${message}`);
 		}
+	}
+
+	// pi-subagents posts the rendered result as a `subagent-slash-result`
+	// custom message twice: first with status "running" (just the task echoed
+	// back) at message_start, then again at message_end with the full output.
+	// We forward the second one. Returns the chat info to send to, plus the
+	// formatted text — null if this isn't ours or the message is the in-flight
+	// "running" placeholder.
+	function takeSubagentResultPayload(message: AgentMessage): {
+		chatId: number;
+		replyToId: number;
+		text: string;
+	} | null {
+		if (message.role !== "custom") return null;
+		const cm = message as { customType?: string; content?: unknown; details?: unknown };
+		if (cm.customType !== "subagent-slash-result") return null;
+
+		const details = cm.details as
+			| { result?: { details?: { results?: Array<{ agent?: string; exitCode?: number; finalOutput?: string; error?: string; outputReference?: { message?: string } }> } } }
+			| undefined;
+		const first = details?.result?.details?.results?.[0];
+		if (!first) return null;
+		// The "running" placeholder lacks exitCode / finalOutput. Only forward
+		// the terminal one.
+		if (first.exitCode === undefined && !first.error) return null;
+
+		const agent = first.agent ?? "";
+		const idx = pendingSubagentDispatches.findIndex((d) => d.agent === agent);
+		if (idx === -1) return null;
+		const [pending] = pendingSubagentDispatches.splice(idx, 1);
+
+		const header = first.exitCode === 0 ? `✅ /run ${agent}` : `❌ /run ${agent} (exit ${first.exitCode ?? "?"})`;
+		const body = first.error
+			? first.error
+			: (first.finalOutput?.trim() || first.outputReference?.message || "(no output)");
+		return { chatId: pending.chatId, replyToId: pending.replyToId, text: `${header}\n\n${body}` };
 	}
 
 	// ========================================================================
@@ -2817,6 +2874,7 @@ export default function (pi: ExtensionAPI) {
 			void sendTextReply(chatId, pending.promptMessageId, "Cancelled — pi session ended.");
 		}
 		pendingAgentTaskInputs.clear();
+		pendingSubagentDispatches.length = 0;
 		for (const state of mediaGroups.values()) {
 			if (state.flushTimer) clearTimeout(state.flushTimer);
 		}
@@ -2870,6 +2928,12 @@ export default function (pi: ExtensionAPI) {
 		}
 		previewState.pendingText = getMessageText(event.message);
 		schedulePreviewFlush(activeTelegramTurn.chatId);
+	});
+
+	pi.on("message_end", async (event, _ctx) => {
+		const payload = takeSubagentResultPayload(event.message);
+		if (!payload) return;
+		await sendTextReply(payload.chatId, payload.replyToId, payload.text);
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
