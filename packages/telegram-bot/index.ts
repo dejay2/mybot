@@ -1956,6 +1956,20 @@ export default function (pi: ExtensionAPI) {
 	// chatId -> pending agent run awaiting a flag selection
 	const pendingAgentRuns = new Map<number, PendingAgentRun>();
 
+	interface PendingAgentTaskInput {
+		agent: string;
+		bg: boolean;
+		fork: boolean;
+		originalReplyToId: number;
+		promptMessageId: number;
+	}
+	// chatId -> pending agent run awaiting the task text in the user's NEXT
+	// message. We can't reuse pendingUiPrompts because that's awaited from
+	// agent code; here we're inside the polling loop, so awaiting the prompt
+	// would deadlock — it would block the same handler that needs to read the
+	// next update.
+	const pendingAgentTaskInputs = new Map<number, PendingAgentTaskInput>();
+
 	function buildAgentRunKeyboard(agent: string, taskHint: string): {
 		text: string;
 		keyboard: Array<Array<{ text: string; callback_data: string }>>;
@@ -2052,26 +2066,74 @@ export default function (pi: ExtensionAPI) {
 
 		pendingAgentRuns.delete(chatId);
 		const flagsLabel = [bg ? "--bg" : null, fork ? "--fork" : null].filter(Boolean).join(" ") || "no flags";
-		void stripKeyboardWithReply(chatId, keyboardMessageId, `▶️ Running ${pending.agent} (${flagsLabel})…`);
 
-		// Ask for the task if it wasn't supplied inline. Reuses the existing
-		// ui-prompt input plumbing — `consumePendingInput` will pick up the next
-		// plain-text message in this chat as the answer.
-		let task = pending.taskHint;
-		if (!task) {
-			const answer = await uiInputViaTelegram(
-				chatId,
-				`Task for ${pending.agent}:`,
-				"what should the agent do?",
-			);
-			if (answer === undefined) {
-				await sendTextReply(chatId, pending.originalReplyToId, `Cancelled — no task supplied for ${pending.agent}.`);
-				return true;
-			}
-			task = answer.trim();
+		if (pending.taskHint) {
+			void stripKeyboardWithReply(chatId, keyboardMessageId, `▶️ Running ${pending.agent} (${flagsLabel})…`);
+			await dispatchAgentRun(chatId, pending.originalReplyToId, pending.agent, pending.taskHint, bg, fork);
+			return true;
 		}
 
-		const argsParts = [pending.agent];
+		// No inline task — ask for it. We CANNOT await user input from inside the
+		// callback handler because the polling loop's `await handleUpdate(...)`
+		// is what would deliver that input. Awaiting here would deadlock until
+		// the prompt timer fires (5min), at which point /run cancels and the
+		// user's task message dispatches as a normal chat turn — exactly the
+		// symptom we hit. Instead, set state and return; the next text message
+		// in this chat is consumed by handleAuthorizedTelegramMessage.
+		void stripKeyboardWithReply(chatId, keyboardMessageId, `${pending.agent} (${flagsLabel}) — awaiting task…`);
+
+		const evicted = pendingAgentTaskInputs.get(chatId);
+		if (evicted) {
+			pendingAgentTaskInputs.delete(chatId);
+			void sendTextReply(chatId, evicted.promptMessageId, "Cancelled — superseded by a new /run.");
+		}
+
+		try {
+			const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
+				chat_id: chatId,
+				text: `Task for ${pending.agent}:\nReply with the task, or send /cancel to abort.`,
+			});
+			pendingAgentTaskInputs.set(chatId, {
+				agent: pending.agent,
+				bg,
+				fork,
+				originalReplyToId: pending.originalReplyToId,
+				promptMessageId: sent.message_id,
+			});
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			await sendTextReply(chatId, pending.originalReplyToId, `Failed to ask for task: ${message}`);
+		}
+		return true;
+	}
+
+	// Returns true if the message was consumed as the task for a pending /run.
+	// Called from handleAuthorizedTelegramMessage before normal dispatch.
+	function tryConsumeAgentTaskInput(message: TelegramMessage): boolean {
+		const pending = pendingAgentTaskInputs.get(message.chat.id);
+		if (!pending) return false;
+		const text = (message.text ?? message.caption ?? "").trim();
+		if (!text) return false; // photo/doc with no caption — don't consume; let user reply with text
+		pendingAgentTaskInputs.delete(message.chat.id);
+		if (text === "/cancel") {
+			void sendTextReply(message.chat.id, pending.originalReplyToId, `Cancelled /run ${pending.agent}.`);
+			return true;
+		}
+		// Fire-and-forget: dispatchAgentRun internally awaits pi.executeCommand,
+		// which for non-bg runs can take a while. Don't block the polling loop.
+		void dispatchAgentRun(message.chat.id, pending.originalReplyToId, pending.agent, text, pending.bg, pending.fork);
+		return true;
+	}
+
+	async function dispatchAgentRun(
+		chatId: number,
+		originalReplyToId: number,
+		agent: string,
+		task: string,
+		bg: boolean,
+		fork: boolean,
+	): Promise<void> {
+		const argsParts = [agent];
 		if (task) argsParts.push(task);
 		if (bg) argsParts.push("--bg");
 		if (fork) argsParts.push("--fork");
@@ -2080,32 +2142,24 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const exec = (pi as { executeCommand?: (name: string, args?: string) => Promise<boolean> }).executeCommand;
 			if (typeof exec !== "function") {
-				await sendTextReply(chatId, pending.originalReplyToId, "/run: this pi build doesn't support remote command dispatch.");
-				return true;
+				await sendTextReply(chatId, originalReplyToId, "/run: this pi build doesn't support remote command dispatch.");
+				return;
 			}
-			pendingTelegramCommandReply = {
-				chatId,
-				messageId: pending.originalReplyToId,
-				suppressAck: false,
-			};
+			pendingTelegramCommandReply = { chatId, messageId: originalReplyToId, suppressAck: false };
 			try {
 				const handled = await exec("run", args);
-				const suppressAck = pendingTelegramCommandReply?.suppressAck ?? false;
 				if (!handled) {
-					await sendTextReply(chatId, pending.originalReplyToId, "/run is not registered (is pi-subagents installed?).");
-				} else if (!suppressAck) {
-					// pi-subagents reports its own progress via the slash-result entry,
-					// which the Telegram bridge surfaces through normal message flow.
-					// No extra ack needed.
+					await sendTextReply(chatId, originalReplyToId, "/run is not registered (is pi-subagents installed?).");
 				}
+				// pi-subagents emits its own progress via the slash-result entry,
+				// surfaced through the normal Telegram message flow — no extra ack.
 			} finally {
 				pendingTelegramCommandReply = undefined;
 			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			await sendTextReply(chatId, pending.originalReplyToId, `/run ${pending.agent} failed: ${message}`);
+			await sendTextReply(chatId, originalReplyToId, `/run ${agent} failed: ${message}`);
 		}
-		return true;
 	}
 
 	// ========================================================================
@@ -2297,6 +2351,13 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function handleAuthorizedTelegramMessage(message: TelegramMessage, ctx: ExtensionContext): Promise<void> {
+		// If a /run_<agent> picker is awaiting the task text, this message is
+		// the task — consume it and dispatch /run instead of starting a chat
+		// turn. Checked before pendingUiPrompts because the agent-task input
+		// uses its own non-blocking state machine (see comment near
+		// pendingAgentTaskInputs).
+		if (tryConsumeAgentTaskInput(message)) return;
+
 		// If an extension is awaiting ui.input for this chat, the next plain-text
 		// message becomes the answer and is NOT dispatched as a new turn. Photos,
 		// docs, etc. fall through to normal dispatch — the prompt keeps waiting.
@@ -2752,6 +2813,10 @@ export default function (pi: ExtensionAPI) {
 			void stripKeyboardWithReply(chatId, pending.keyboardMessageId, "Cancelled — pi session ended.");
 		}
 		pendingAgentRuns.clear();
+		for (const [chatId, pending] of Array.from(pendingAgentTaskInputs.entries())) {
+			void sendTextReply(chatId, pending.promptMessageId, "Cancelled — pi session ended.");
+		}
+		pendingAgentTaskInputs.clear();
 		for (const state of mediaGroups.values()) {
 			if (state.flushTimer) clearTimeout(state.flushTimer);
 		}
