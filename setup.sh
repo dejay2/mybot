@@ -189,25 +189,36 @@ if [[ "$WITH_SEARCH" = "1" ]]; then
   fi
 fi
 
-# Register pi-memory (npm) and the local telegram-bot package. Pi's package
-# manager treats anything that isn't npm:/git:/etc. as a local path and loads
-# from disk directly — no clone, no pull, no symlink hack.
-# Order matters: pi-memory's before_agent_start hook registers first so its
-# `## Memory` block lands above the Telegram bridge's suffix.
+# Register the canonical pi extensions and the local telegram-bot package. Pi's
+# package manager treats anything that isn't npm:/git:/etc. as a local path and
+# loads from disk directly — no clone, no pull, no symlink hack.
+# Order matters: memory + web-access run early (their before_agent_start hooks
+# register first), so their context-injection blocks land above the Telegram
+# bridge's suffix. The canonical list lives in scripts/sync-extensions.sh too —
+# keep them in sync. Run `./scripts/sync-extensions.sh` on existing installs
+# to add new entries without clobbering local additions.
 SETTINGS_PATH="$RUNTIME_DIR/settings.json"
 if [[ ! -f "$SETTINGS_PATH" ]]; then
   cat > "$SETTINGS_PATH" <<EOF
 {
   "packages": [
+    "npm:pi-web-access",
+    "npm:pi-claude-bridge",
     "npm:pi-memory",
+    "npm:pi-subagents",
+    "npm:pi-mcp-adapter",
+    "npm:pi-docparser",
+    "npm:pi-schedule-prompt",
+    "npm:pi-continue",
+    "npm:pi-permission-system",
     "$REPO_ROOT/packages/telegram-bot"
   ]
 }
 EOF
-  echo "    settings.json created with pi-memory + local telegram-bot package"
+  echo "    settings.json created with canonical pi extensions + local telegram-bot"
 else
   echo "    settings.json already exists; leaving package list alone"
-  echo "    (to enable memory: add \"npm:pi-memory\" to packages[] in $SETTINGS_PATH)"
+  echo "    (run ./scripts/sync-extensions.sh to add any newly-canonical packages)"
 fi
 
 CONFIG_PATH="$RUNTIME_DIR/telegram.json"
