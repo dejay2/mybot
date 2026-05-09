@@ -1982,8 +1982,25 @@ export default function (pi: ExtensionAPI) {
 		replyToId: number;
 		agent: string;
 		dispatchedAt: number;
+		// Per-dispatch typing interval. Telegram's typing indicator lasts ~5s,
+		// so we re-send every 4s until the result arrives (or 5min, whichever
+		// first). Tracked per-dispatch rather than via the global typingLoop so
+		// concurrent regular turns aren't disrupted.
+		typingTimer: ReturnType<typeof setInterval>;
 	}
 	const pendingSubagentDispatches: PendingSubagentDispatch[] = [];
+
+	function startSubagentTyping(chatId: number): ReturnType<typeof setInterval> {
+		const sendTyping = (): void => {
+			void callTelegram("sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
+		};
+		sendTyping();
+		const timer = setInterval(sendTyping, 4000);
+		// Auto-clear after 5 minutes so we never leak a forever-typing indicator
+		// if the subagent crashes without posting a terminal slash-result.
+		setTimeout(() => clearInterval(timer), 5 * 60 * 1000);
+		return timer;
+	}
 
 	function buildAgentRunKeyboard(agent: string, taskHint: string): {
 		text: string;
@@ -2162,14 +2179,18 @@ export default function (pi: ExtensionAPI) {
 			}
 			// Record before exec so the message_end listener can match — the
 			// subagent posts message_start within ms of dispatch.
-			pendingSubagentDispatches.push({ chatId, replyToId: originalReplyToId, agent, dispatchedAt: Date.now() });
+			const typingTimer = startSubagentTyping(chatId);
+			pendingSubagentDispatches.push({ chatId, replyToId: originalReplyToId, agent, dispatchedAt: Date.now(), typingTimer });
 			pendingTelegramCommandReply = { chatId, messageId: originalReplyToId, suppressAck: false };
 			try {
 				const handled = await exec("run", args);
 				if (!handled) {
 					// Drop the entry we just queued — no result will arrive.
 					const idx = pendingSubagentDispatches.findIndex((d) => d.chatId === chatId && d.agent === agent);
-					if (idx !== -1) pendingSubagentDispatches.splice(idx, 1);
+					if (idx !== -1) {
+						clearInterval(pendingSubagentDispatches[idx].typingTimer);
+						pendingSubagentDispatches.splice(idx, 1);
+					}
 					await sendTextReply(chatId, originalReplyToId, "/run is not registered (is pi-subagents installed?).");
 				}
 				// On success, forwardSubagentSlashResult sends the result when the
@@ -2211,6 +2232,7 @@ export default function (pi: ExtensionAPI) {
 		const idx = pendingSubagentDispatches.findIndex((d) => d.agent === agent);
 		if (idx === -1) return null;
 		const [pending] = pendingSubagentDispatches.splice(idx, 1);
+		clearInterval(pending.typingTimer);
 
 		const header = first.exitCode === 0 ? `✅ /run ${agent}` : `❌ /run ${agent} (exit ${first.exitCode ?? "?"})`;
 		const body = first.error
@@ -2874,6 +2896,7 @@ export default function (pi: ExtensionAPI) {
 			void sendTextReply(chatId, pending.promptMessageId, "Cancelled — pi session ended.");
 		}
 		pendingAgentTaskInputs.clear();
+		for (const d of pendingSubagentDispatches) clearInterval(d.typingTimer);
 		pendingSubagentDispatches.length = 0;
 		for (const state of mediaGroups.values()) {
 			if (state.flushTimer) clearTimeout(state.flushTimer);
